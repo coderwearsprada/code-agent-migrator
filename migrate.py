@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 migrate.py — Migrate settings + custom configuration between Claude Code
-(~/.claude) and Codex CLI (~/.codex), in either direction.
+(~/.claude), Codex CLI (~/.codex), and Cursor (~/.cursor), in any pairwise
+direction.
 
 Requires Python 3.9+. No third-party dependencies.
 
@@ -33,10 +34,15 @@ Migration runs in five phases:
      settings.json) compose correctly.
 
 The round-trippable pieces of content (Codex `instructions`, Claude
-`outputStyle` files, slash-command frontmatter `description`/
-`argument-hint`) ride along inside HTML comments that the reverse
-direction recognizes and unwraps. See the `fenced_block` / `extract_fenced`
-and `frontmatter_to_meta_comment` / `meta_comment_to_frontmatter` helpers.
+`outputStyle` files, and slash-command frontmatter carried into targets
+without native support for it) ride along inside HTML comments that the
+reverse direction recognizes and unwraps. See the `fenced_block` /
+`extract_fenced` and `frontmatter_to_meta_comment` /
+`meta_comment_to_frontmatter` helpers.
+
+Skills need none of that: Claude Code, Codex CLI, and Cursor all speak the
+open Agent Skills format (skills/<name>/SKILL.md + assets), so skills copy
+verbatim in every direction.
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import uuid
@@ -237,12 +244,19 @@ CLAUDE_UNMAPPABLE_KEYS = (
     "autoUpdates", "verbose", "theme", "preferredNotifChannel",
     "enableAllProjectMcpServers", "enabledMcpjsonServers",
     "disabledMcpjsonServers", "alwaysThinkingEnabled",
+    # Newer Claude Code (2.1.15x+) surface with no Codex equivalent.
+    "fallbackModel", "availableModels", "defaultMode", "autoMemoryEnabled",
+    "attribution", "sandbox", "autoMode",
 )
 CODEX_UNMAPPABLE_KEYS = (
     "model_provider", "model_providers", "tools", "tui",
     "hide_agent_reasoning", "show_raw_agent_reasoning",
     "model_reasoning_summary", "reasoning_summary", "model_verbosity",
     "disable_response_storage", "history", "project_doc_max_bytes",
+    # Newer Codex (0.13x+) surface with no Claude Code equivalent.
+    "web_search", "features", "default_permissions", "permissions",
+    "agents", "memories", "apps", "plugins", "service_tier",
+    "project_doc_fallback_filenames",
 )
 
 # Claude `effortLevel` and Codex `model_reasoning_effort` share the
@@ -364,10 +378,11 @@ def strip_frontmatter(text: str) -> tuple[str, dict | None]:
 def meta_comment_to_frontmatter(text: str) -> tuple[str, dict | None]:
     """Inverse of frontmatter_to_meta_comment().
 
-    Codex prompts don't have a frontmatter spec, but slash-command authors
-    rely on Claude's `description` and `argument-hint` keys. We smuggle
-    those across as a `<!-- migrator:meta ... -->` HTML comment so a
-    Codex→Claude pass can reconstruct the frontmatter byte-for-byte.
+    The `<!-- migrator:meta ... -->` HTML comment carries slash-command
+    frontmatter (`description`, `argument-hint`) through targets that
+    don't support those keys natively — Cursor skills today, and Codex
+    prompts migrated by older versions of this tool (Codex prompts gained
+    native frontmatter for both keys since).
     """
     m = MIGRATOR_META_RE.match(text)
     if not m:
@@ -404,6 +419,13 @@ def safe_cursor_rule_name(name: str, fallback: str = "migrated") -> str:
 
 def safe_agent_name(name: str, fallback: str = "agent") -> str:
     stem = re.sub(r"[^A-Za-z0-9_-]+", "-", str(name)).strip("-_")
+    return stem or fallback
+
+
+def safe_skill_name(name: str, fallback: str = "migrated") -> str:
+    """Skill names must be lowercase letters/digits/hyphens and match the
+    skill's directory name (the Agent Skills standard all three tools use)."""
+    stem = re.sub(r"[^a-z0-9-]+", "-", str(name).lower()).strip("-")
     return stem or fallback
 
 
@@ -759,6 +781,13 @@ def tier_a_docs_codex_to_claude(ctx: Ctx) -> None:
 
 
 def tier_a_commands_to_prompts(ctx: Ctx) -> None:
+    """Claude slash commands → Codex custom prompts.
+
+    Codex prompts natively support `description` and `argument-hint`
+    frontmatter now, so those keys carry over as real frontmatter instead
+    of the meta-comment smuggling older versions needed. Other frontmatter
+    keys (`model`, `allowed-tools`, …) have no prompt equivalent and are
+    dropped with a note."""
     src_dir = ctx.src_root / "commands"
     if not src_dir.is_dir():
         return
@@ -766,12 +795,15 @@ def tier_a_commands_to_prompts(ctx: Ctx) -> None:
     for f in sorted(src_dir.rglob("*.md")):
         rel = f.relative_to(src_dir)
         body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
-        meta = frontmatter_to_meta_comment(fm or {})
-        dropped = sorted((fm or {}).keys() - {"description", "argument-hint"})
+        fm = fm or {}
+        keep = {k: v for k, v in fm.items()
+                if k in ("description", "argument-hint")}
+        dropped = sorted(fm.keys() - keep.keys())
         if dropped:
             ctx.report.notes.append(
                 f"commands/{rel}: dropped frontmatter keys: {', '.join(dropped)}")
-        write_text(ctx, dst_dir / rel, meta + body)
+        out = (make_frontmatter(keep) if keep else "") + body
+        write_text(ctx, dst_dir / rel, out)
         ctx.report.migrated_clean.append(f"commands/{rel} → prompts/{rel}")
 
 
@@ -783,11 +815,45 @@ def tier_a_prompts_to_commands(ctx: Ctx) -> None:
     for f in sorted(src_dir.rglob("*.md")):
         rel = f.relative_to(src_dir)
         text = f.read_text(encoding="utf-8")
-        body, meta = meta_comment_to_frontmatter(text)
-        if meta:
-            body = make_frontmatter(meta) + body
+        body, fm = strip_frontmatter(text)
+        if fm is None:
+            # Prompts migrated by older versions carried description/
+            # argument-hint in a migrator:meta comment; still honor it.
+            body, fm = meta_comment_to_frontmatter(text)
+        if fm:
+            body = make_frontmatter(fm) + body
         write_text(ctx, dst_dir / rel, body)
         ctx.report.migrated_clean.append(f"prompts/{rel} → commands/{rel}")
+
+
+def _skill_dirs(root: Path) -> list[Path]:
+    """Skill dirs under <root>/skills — one dir per skill, identified by a
+    SKILL.md inside. Hidden dirs are skipped: Codex keeps system-managed
+    skills under `skills/.system/`, which belong to the tool, not the user."""
+    skills_root = root / "skills"
+    if not skills_root.is_dir():
+        return []
+    out: list[Path] = []
+    for d in sorted(skills_root.iterdir()):
+        if d.is_dir() and not d.name.startswith(".") and (d / "SKILL.md").is_file():
+            out.append(d)
+    return out
+
+
+def tier_a_skills_copy(ctx: Ctx) -> None:
+    """skills/<name>/ → skills/<name>/ — Claude Code, Codex CLI, and Cursor
+    all speak the same Agent Skills format (SKILL.md + bundled assets), so
+    skills transfer as a verbatim tree copy in every direction."""
+    for skill_dir in _skill_dirs(ctx.src_root):
+        dst_dir = ctx.dst_root / "skills" / skill_dir.name
+        n_files = 0
+        for f in sorted(skill_dir.rglob("*")):
+            if f.is_file():
+                copy_file(ctx, f, dst_dir / f.relative_to(skill_dir))
+                n_files += 1
+        ctx.report.migrated_clean.append(
+            f"skills/{skill_dir.name}/ → skills/{skill_dir.name}/ "
+            f"({n_files} file(s), incl. assets)")
 
 
 def tier_a_codex_agents_to_claude(ctx: Ctx) -> None:
@@ -828,15 +894,131 @@ def tier_a_codex_agents_to_claude(ctx: Ctx) -> None:
         ctx.report.migrated_clean.append(f"agents/{f.name} → agents/{name}.md")
 
 
+def _parse_cursor_model(model: str) -> tuple[str, str | None]:
+    """Split Cursor's model bracket syntax — `model-id[effort=high,...]` —
+    into (model_id, effort_or_None). Plain model ids pass through."""
+    m = re.fullmatch(r"(?P<id>[^\[\]]+)\[(?P<params>[^\]]*)\]", model.strip())
+    if not m:
+        return model.strip(), None
+    effort = None
+    for part in m.group("params").split(","):
+        k, _, v = part.partition("=")
+        if k.strip() == "effort" and v.strip():
+            effort = v.strip()
+    return m.group("id").strip(), effort
+
+
+def tier_a_cursor_agents_to_claude(ctx: Ctx) -> None:
+    """Cursor subagents (.cursor/agents/*.md) → Claude subagents.
+
+    Cursor 2.4+ subagents are markdown + frontmatter like Claude's;
+    name/description/model translate directly, Cursor's model bracket
+    effort (`model[effort=high]`) splits into Claude's `effort` field, and
+    `is_background` maps to Claude's `background`. Cursor's `readonly`
+    flag has no exact Claude field and is preserved as a review note."""
+    src_dir = ctx.src_root / "agents"
+    if not src_dir.is_dir():
+        return
+    dst_dir = ctx.dst_root / "agents"
+    for f in sorted(src_dir.rglob("*.md")):
+        if f.stem == "README":
+            continue
+        body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+        fm = fm or {}
+        name = safe_agent_name(fm.get("name") or f.stem)
+        out_fm: dict[str, str] = {
+            "name": name,
+            "description": fm.get("description")
+            or f"Imported from Cursor subagent {name}.",
+        }
+        model = fm.get("model")
+        if model and model != "inherit":
+            model_id, effort = _parse_cursor_model(model)
+            out_fm["model"] = model_id
+            if effort:
+                out_fm["effort"] = _codex_effort_to_claude(effort) or effort
+        if str(fm.get("is_background", "")).lower() == "true":
+            out_fm["background"] = "true"
+        notes: list[str] = []
+        if str(fm.get("readonly", "")).lower() == "true":
+            notes.append(
+                "Cursor readonly=true has no exact Claude subagent field; "
+                "restrict `tools` or use permissions if enforcement is needed.")
+        if notes:
+            body = body.rstrip() + "\n\n## Manual migration notes\n\n" + \
+                "\n".join(f"- {n}" for n in notes)
+        write_text(ctx, dst_dir / f"{name}.md",
+                   make_frontmatter(out_fm) + body.rstrip() + "\n")
+        ctx.report.migrated_clean.append(f"agents/{f.name} → agents/{name}.md")
+
+
+def tier_a_commands_to_cursor_skills(ctx: Ctx, src_subdir: str,
+                                     src_label: str) -> None:
+    """Slash commands (Claude commands/, Codex prompts/) → Cursor skills
+    with `disable-model-invocation: true`.
+
+    Cursor deprecated `.cursor/commands/*.md` in favor of skills; a skill
+    with `disable-model-invocation: true` is the modern equivalent of a
+    slash command (invocable from the / menu, never auto-triggered).
+    `argument-hint` and other extra frontmatter ride along in a
+    migrator:meta comment so nothing is silently dropped."""
+    src_dir = ctx.src_root / src_subdir
+    if not src_dir.is_dir():
+        return
+    for f in sorted(src_dir.rglob("*.md")):
+        rel = f.relative_to(src_dir)
+        text = f.read_text(encoding="utf-8")
+        body, fm = strip_frontmatter(text)
+        if fm is None:
+            # Codex prompts carry claude-origin frontmatter in a meta comment.
+            body, fm = meta_comment_to_frontmatter(text)
+        fm = fm or {}
+        name = safe_skill_name(rel.as_posix().replace("/", "-").rsplit(".", 1)[0])
+        out_fm: dict[str, str] = {
+            "name": name,
+            "description": fm.get("description") or f"Slash command /{name}",
+            "disable-model-invocation": "true",
+        }
+        meta = frontmatter_to_meta_comment(
+            {k: v for k, v in fm.items() if k == "argument-hint"})
+        dropped = sorted(fm.keys() - {"description", "argument-hint"})
+        if dropped:
+            ctx.report.notes.append(
+                f"{src_subdir}/{rel}: dropped frontmatter keys: {', '.join(dropped)}")
+        write_text(ctx, ctx.dst_root / "skills" / name / "SKILL.md",
+                   make_frontmatter(out_fm) + meta + body.lstrip("\n"))
+        ctx.report.migrated_clean.append(
+            f"{src_label}/{rel} → skills/{name}/SKILL.md "
+            "(slash-invocable Cursor skill)")
+
+
+def _mcp_transport(spec: dict) -> str:
+    """Infer the transport of a Claude/Cursor-shaped MCP spec. Cursor omits
+    `type` for remote servers, so a bare `url` means streamable HTTP."""
+    t = str(spec.get("type") or "").lower()
+    if t:
+        return {"streamable-http": "http"}.get(t, t)
+    return "http" if spec.get("url") else "stdio"
+
+
 def _normalize_mcp_claude_to_codex(name: str, spec: dict, report: Report) -> dict | None:
-    """Codex only speaks stdio MCP; Claude's SSE/HTTP servers can't be
-    represented and get reported as skipped."""
-    t = (spec.get("type") or "stdio").lower()
+    """Codex speaks stdio and streamable HTTP MCP. SSE (deprecated) and
+    WebSocket servers can't be represented and get reported as skipped."""
+    t = _mcp_transport(spec)
+    if t == "http":
+        if not spec.get("url"):
+            report.skipped_unmappable.append(f"MCP server '{name}' has no url")
+            return None
+        out: dict[str, Any] = {"url": spec["url"]}
+        if spec.get("headers"):
+            out["http_headers"] = dict(spec["headers"])
+        return out
     if t != "stdio":
         report.skipped_unmappable.append(
-            f"MCP server '{name}' uses type='{t}' (Codex only supports stdio)")
+            f"MCP server '{name}' uses type='{t}' "
+            "(Codex supports stdio and streamable HTTP)")
         return None
-    out: dict[str, Any] = {}
+    out = {}
     if "command" in spec:
         out["command"] = spec["command"]
     if spec.get("args"):
@@ -850,7 +1032,12 @@ def _normalize_mcp_claude_to_codex(name: str, spec: dict, report: Report) -> dic
 
 
 def _normalize_mcp_codex_to_claude(spec: dict) -> dict:
-    out: dict[str, Any] = {"type": "stdio"}
+    if spec.get("url"):
+        out: dict[str, Any] = {"type": "http", "url": spec["url"]}
+        if spec.get("http_headers"):
+            out["headers"] = dict(spec["http_headers"])
+        return out
+    out = {"type": "stdio"}
     for k in ("command", "args", "env"):
         if spec.get(k):
             out[k] = spec[k] if k == "command" else (
@@ -1229,6 +1416,22 @@ def cursor_write_rules(rules: list[CursorRule], cursor_root: Path,
         write_text(ctx, rules_dir / f"{safe_cursor_rule_name(r.name)}.mdc", body)
 
 
+def cursor_cli_config_write_model(ctx: Ctx, model: str) -> None:
+    """Carry the default model into Cursor's CLI config
+    (<cursor_root>/cli-config.json, `version: 1`). Model ids aren't
+    renamed — fix the id by hand if the destination doesn't know it."""
+    p = ctx.dst_root / "cli-config.json"
+    existing = load_json(p) if (ctx.merge and p.exists()) else {}
+    existing.setdefault("version", 1)
+    existing["model"] = model
+    write_text(ctx, p, json.dumps(existing, indent=2) + "\n")
+
+
+def cursor_cli_config_read_model(cursor_root: Path) -> str | None:
+    model = load_json(cursor_root / "cli-config.json").get("model")
+    return model if isinstance(model, str) and model else None
+
+
 def _cursor_label_mcp(direction: str, mcp: dict) -> str:
     return (f"mcpServers ({len(mcp)} entr{'y' if len(mcp) == 1 else 'ies'}) "
             f"{direction}")
@@ -1238,16 +1441,21 @@ def _normalize_mcp_for_cursor(spec: dict) -> dict:
     """Cursor accepts the Claude shape verbatim (stdio + SSE/HTTP). Keep
     documented keys only — drop anything migrator-internal."""
     out: dict = {}
-    for k in ("command", "args", "env", "type", "url"):
+    for k in ("command", "args", "env", "type", "url", "headers"):
         if k in spec and spec[k] is not None:
             out[k] = spec[k]
     return out
 
 
 def _native_mcp_from_codex(name: str, spec: dict) -> dict:
-    """Codex stores stdio MCP under a TOML table; produce a Claude/Cursor
-    JSON-shaped dict."""
-    out: dict = {"type": "stdio"}
+    """Codex stores MCP under a TOML table (stdio or streamable HTTP);
+    produce a Claude/Cursor JSON-shaped dict."""
+    if spec.get("url"):
+        out: dict = {"url": spec["url"]}
+        if spec.get("http_headers"):
+            out["headers"] = dict(spec["http_headers"])
+        return out
+    out = {"type": "stdio"}
     for k in ("command", "args", "env"):
         if spec.get(k):
             out[k] = list(spec[k]) if k == "args" else (
@@ -1282,18 +1490,39 @@ def run_claude_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         cursor_write_mcp(out, ctx.dst_root, ctx)
         ctx.report.migrated_clean.append(_cursor_label_mcp("→ cursor mcp.json", out))
 
-    # Settings keys with no Cursor equivalent (truly Tier C).
-    for key in ("hooks", "permissions", "statusLine", "outputStyle"):
+    # Tier A: skills (shared Agent Skills format) + slash commands (Cursor
+    # deprecated .cursor/commands in favor of slash-invocable skills).
+    tier_a_skills_copy(ctx)
+    tier_a_commands_to_cursor_skills(ctx, "commands", "commands")
+
+    # Tier A: default model → Cursor CLI config.
+    if isinstance(settings.get("model"), str):
+        cursor_cli_config_write_model(ctx, settings["model"])
+        ctx.report.migrated_clean.append(
+            "settings.json:model → cli-config.json:model")
+
+    # Settings keys with no Cursor equivalent (truly Tier C). Hooks have a
+    # Tier B option below; permissions have a partial Cursor CLI analog
+    # the user has to build by hand.
+    for key in ("effortLevel", "env"):
         if settings.get(key):
             ctx.report.skipped_unmappable.append(
                 f"settings.json:{key} (Cursor has no equivalent)")
-    # `plugins/` is the only source dir with no Tier B option — agents,
-    # skills, and commands are handled by their cursor-bound Tier B
-    # options below.
+    if settings.get("permissions"):
+        ctx.report.skipped_unmappable.append(
+            "settings.json:permissions (no automatic mapping — Cursor CLI "
+            "has its own allow/deny rules in ~/.cursor/cli-config.json)")
+    for key in ("statusLine", "outputStyle"):
+        if settings.get(key):
+            ctx.report.skipped_unmappable.append(
+                f"settings.json:{key} (Cursor has no equivalent)")
+    # `plugins/`: Cursor has a plugin system now, but the layouts differ
+    # (Claude marketplaces vs .cursor-plugin manifests) — manual only.
     plugins_dir = ctx.src_root / "plugins"
     if plugins_dir.is_dir() and any(plugins_dir.iterdir()):
         ctx.report.skipped_unmappable.append(
-            "plugins/ (Cursor has no equivalent)")
+            "plugins/ (Cursor plugins use a different manifest format — "
+            "reinstall from the Cursor marketplace)")
 
     # Tier B options applicable in this direction.
     _run_lossy(ctx, lossy_decisions, "claude->cursor")
@@ -1319,16 +1548,37 @@ def run_cursor_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         ctx.report.migrated_clean.append(
             _cursor_label_mcp(f"→ {claude_mcp_path(ctx).name}:mcpServers", mcp))
 
+    tier_a_skills_copy(ctx)
+    tier_a_cursor_agents_to_claude(ctx)
+
+    model = cursor_cli_config_read_model(ctx.src_root)
+    if model:
+        dst = ctx.dst_root / "settings.json"
+        existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+        existing["model"] = model
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+        ctx.report.migrated_clean.append(
+            "cli-config.json:model → settings.json:model")
+
     _run_lossy(ctx, lossy_decisions, "cursor->claude")
 
 
 # ---- codex → cursor --------------------------------------------------------
 
 def run_codex_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
-    # Tier A: AGENTS.md → cursor rules.
+    # Tier A: AGENTS.md → cursor rules. At project scope, Cursor reads
+    # <project>/AGENTS.md natively, so the file already works as-is; the
+    # rules copy is only needed for user scope (~/.codex/AGENTS.md has no
+    # Cursor-side equivalent location).
     src_doc = (ctx.src_doc if ctx.src_doc and ctx.src_doc.exists()
                else ctx.src_root / "AGENTS.md")
-    if src_doc.exists():
+    project_root = cursor_project_root_from(ctx.dst_root)
+    if (project_root and src_doc.exists()
+            and src_doc == project_root / "AGENTS.md"):
+        ctx.report.notes.append(
+            "AGENTS.md at the project root is read natively by Cursor — "
+            "no translation needed")
+    elif src_doc.exists():
         text = src_doc.read_text(encoding="utf-8")
         rules = doc_to_cursor_rules(text)
         if rules:
@@ -1343,6 +1593,14 @@ def run_codex_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         out = {n: _native_mcp_from_codex(n, s) for n, s in mcp.items()}
         cursor_write_mcp(out, ctx.dst_root, ctx)
         ctx.report.migrated_clean.append(_cursor_label_mcp("→ cursor mcp.json", out))
+
+    tier_a_skills_copy(ctx)
+    tier_a_commands_to_cursor_skills(ctx, "prompts", "prompts")
+
+    if isinstance(cfg.get("model"), str):
+        cursor_cli_config_write_model(ctx, cfg["model"])
+        ctx.report.migrated_clean.append(
+            "config.toml:model → cli-config.json:model")
 
     # Codex-only items with no Cursor equivalent.
     for k in ("approval_policy", "sandbox_mode", "sandbox_workspace_write",
@@ -1374,24 +1632,23 @@ def run_cursor_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         existing = load_toml(dst) if (ctx.merge and dst.exists()) else {}
         existing.setdefault("mcp_servers", {})
         for name, spec in mcp.items():
-            t = (spec.get("type") or "stdio").lower()
-            if t != "stdio":
-                ctx.report.skipped_unmappable.append(
-                    f"MCP server '{name}' uses type='{t}' "
-                    "(Codex only supports stdio)")
-                continue
-            out: dict = {}
-            if "command" in spec:
-                out["command"] = spec["command"]
-            if spec.get("args"):
-                out["args"] = list(spec["args"])
-            if spec.get("env"):
-                out["env"] = dict(spec["env"])
-            if out.get("command"):
-                existing["mcp_servers"][name] = out
+            t = _normalize_mcp_claude_to_codex(name, spec, ctx.report)
+            if t is not None:
+                existing["mcp_servers"][name] = t
         write_text(ctx, dst, render_toml(existing))
         ctx.report.migrated_clean.append(
             _cursor_label_mcp("→ config.toml:[mcp_servers.*]", mcp))
+
+    tier_a_skills_copy(ctx)
+
+    model = cursor_cli_config_read_model(ctx.src_root)
+    if model:
+        dst = ctx.dst_root / "config.toml"
+        existing = load_toml(dst) if (ctx.merge and dst.exists()) else {}
+        existing["model"] = model
+        write_text(ctx, dst, render_toml(existing))
+        ctx.report.migrated_clean.append(
+            "cli-config.json:model → config.toml:model")
 
     _run_lossy(ctx, lossy_decisions, "cursor->codex")
 
@@ -1429,7 +1686,135 @@ class LossyOption:
     apply: Callable[[Ctx], None]
 
 
-# ---- B1: permissions ↔ sandbox + approval ---------------------------------
+# ---- B1: permissions ↔ sandbox + approval + prefix rules -------------------
+# Codex has two permission surfaces: the coarse sandbox_mode/approval_policy
+# knobs in config.toml, and per-command Starlark prefix rules in
+# rules/*.rules — `prefix_rule(pattern=["git", "commit"], decision="allow")`.
+# The prefix rules map naturally onto Claude's `Bash(git commit:*)`
+# permission patterns, so both directions translate command rules
+# rule-for-rule and use the sandbox knobs only for the overall posture.
+
+_RULE_DECISION_C2X = {"allow": "allow", "ask": "prompt", "deny": "forbidden"}
+_RULE_DECISION_X2C = {"allow": "allow", "prompt": "ask", "forbidden": "deny"}
+
+
+def _claude_bash_rule_to_tokens(rule: str) -> list[str] | None:
+    """`Bash(git commit:*)` → ["git", "commit"], or None if the rule can't
+    be expressed as a Codex prefix rule (bare Bash, wildcards mid-command,
+    unparseable quoting)."""
+    m = re.fullmatch(r"Bash\((?P<body>.+)\)", rule.strip())
+    if not m:
+        return None
+    body = m.group("body").strip()
+    if body.endswith(":*"):
+        body = body[:-2]
+    if not body or "*" in body:
+        return None
+    try:
+        tokens = shlex.split(body)
+    except ValueError:
+        return None
+    return tokens or None
+
+
+def _render_prefix_rule(tokens: list[str], decision: str) -> str:
+    pattern = ", ".join(json.dumps(t, ensure_ascii=False) for t in tokens)
+    return f'prefix_rule(pattern=[{pattern}], decision="{decision}")'
+
+
+def _parse_prefix_rules(text: str) -> list[tuple[list[str] | None, str]]:
+    """Extract (tokens, decision) pairs from a Codex .rules file.
+
+    Returns tokens=None for patterns this migrator can't translate
+    (union elements — nested lists inside `pattern`). This is a pragmatic
+    scan of the documented `prefix_rule(...)` shape, not a full Starlark
+    parser."""
+    out: list[tuple[list[str] | None, str]] = []
+    for m in re.finditer(r"prefix_rule\s*\(", text):
+        # Walk to the matching close paren, respecting strings.
+        i, depth, in_str, esc = m.end(), 1, False, False
+        while i < len(text) and depth:
+            c = text[i]
+            if esc:
+                esc = False
+            elif in_str:
+                if c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        body = text[m.end():i - 1]
+        pm = re.search(r"pattern\s*=\s*\[", body)
+        if not pm:
+            continue
+        # Balanced-bracket scan for the pattern list (may contain unions).
+        j, bdepth, in_str, esc = pm.end(), 1, False, False
+        while j < len(body) and bdepth:
+            c = body[j]
+            if esc:
+                esc = False
+            elif in_str:
+                if c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == "[":
+                bdepth += 1
+            elif c == "]":
+                bdepth -= 1
+            j += 1
+        inner = body[pm.end():j - 1]
+        dm = re.search(r'decision\s*=\s*"(\w+)"', body)
+        decision = dm.group(1) if dm else "allow"
+        if "[" in inner:
+            out.append((None, decision))
+            continue
+        tokens = [re.sub(r'\\(.)', r"\1", t)
+                  for t in re.findall(r'"((?:[^"\\]|\\.)*)"', inner)]
+        out.append((tokens or None, decision))
+    return out
+
+
+def _emit_codex_prefix_rules(ctx: Ctx, perms: dict) -> None:
+    """Claude Bash() permission rules → Codex rules/default.rules.
+
+    Appends to (rather than replaces) default.rules because Codex's smart
+    approvals write user-accepted rules to the same file. Duplicate
+    patterns already present are skipped."""
+    dst = ctx.dst_root / "rules" / "default.rules"
+    existing = dst.read_text(encoding="utf-8") if dst.exists() else ""
+    lines: list[str] = []
+    skipped: list[str] = []
+    for key, decision in _RULE_DECISION_C2X.items():
+        for rule in perms.get(key) or []:
+            if not str(rule).startswith("Bash"):
+                continue
+            tokens = _claude_bash_rule_to_tokens(str(rule))
+            if tokens is None:
+                skipped.append(str(rule))
+                continue
+            rendered = _render_prefix_rule(tokens, decision)
+            if rendered not in existing and rendered not in lines:
+                lines.append(rendered)
+    if lines:
+        body = existing.rstrip() + "\n" if existing.strip() else ""
+        write_text(ctx, dst, body + "\n".join(lines) + "\n")
+        ctx.report.migrated_lossy.append(
+            f"permissions Bash rules → rules/default.rules "
+            f"({len(lines)} prefix rule(s); exact-match rules widen to "
+            "prefix matches)")
+    for rule in skipped:
+        ctx.report.notes.append(
+            f"permissions: {rule} not expressible as a Codex prefix rule "
+            "(covered only by the coarse sandbox mode)")
 
 def _detect_claude_permissions(ctx: Ctx) -> bool:
     s = load_claude_settings(ctx.src_root)
@@ -1442,7 +1827,8 @@ def _preview_claude_permissions(ctx: Ctx) -> str:
     for key in ("allow", "deny", "ask"):
         if s.get(key):
             parts.append(f"{key}={len(s[key])} rules")
-    return "permissions → sandbox_mode + approval_policy (heuristic). " + ", ".join(parts)
+    return ("permissions → sandbox_mode + approval_policy (heuristic) + "
+            "Bash rules → rules/default.rules. " + ", ".join(parts))
 
 
 def _apply_claude_permissions(ctx: Ctx) -> None:
@@ -1494,10 +1880,52 @@ def _apply_claude_permissions(ctx: Ctx) -> None:
     write_text(ctx, dst, render_toml(existing))
     ctx.report.migrated_lossy.append(
         f"permissions → sandbox_mode/approval_policy ({explain})")
-    if s.get("ask"):
-        ctx.report.notes.append(
-            f"permissions.ask ({len(s['ask'])} rules) has no Codex equivalent — "
-            "covered loosely by approval_policy=on-request")
+
+    # Per-command Bash rules translate rule-for-rule into Codex prefix rules.
+    _emit_codex_prefix_rules(ctx, s)
+
+
+def _detect_codex_rules(ctx: Ctx) -> bool:
+    p = ctx.src_root / "rules"
+    return p.is_dir() and any(p.glob("*.rules"))
+
+
+def _preview_codex_rules(ctx: Ctx) -> str:
+    n = 0
+    for f in sorted((ctx.src_root / "rules").glob("*.rules")):
+        n += len(_parse_prefix_rules(f.read_text(encoding="utf-8")))
+    return (f"{n} prefix rule(s) in rules/*.rules → permissions "
+            "Bash(...) patterns (allow/prompt→ask/forbidden→deny)")
+
+
+def _apply_codex_rules(ctx: Ctx) -> None:
+    dst = ctx.dst_root / "settings.json"
+    existing = load_json(dst) if dst.exists() else {}
+    perms = existing.setdefault("permissions", {})
+    added = 0
+    for f in sorted((ctx.src_root / "rules").glob("*.rules")):
+        for tokens, decision in _parse_prefix_rules(
+                f.read_text(encoding="utf-8")):
+            key = _RULE_DECISION_X2C.get(decision)
+            if key is None:
+                ctx.report.notes.append(
+                    f"rules/{f.name}: unknown decision {decision!r} skipped")
+                continue
+            if tokens is None:
+                ctx.report.notes.append(
+                    f"rules/{f.name}: a prefix rule with union pattern "
+                    "elements couldn't be translated — recreate by hand")
+                continue
+            rule = f"Bash({shlex.join(tokens)}:*)"
+            bucket = perms.setdefault(key, [])
+            if rule not in bucket:
+                bucket.append(rule)
+                added += 1
+    if added:
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+        ctx.report.migrated_lossy.append(
+            f"rules/*.rules → permissions ({added} Bash prefix rule(s); "
+            "prefix semantics approximated with :* patterns)")
 
 
 def _detect_codex_sandbox(ctx: Ctx) -> bool:
@@ -1549,22 +1977,39 @@ def _apply_codex_sandbox(ctx: Ctx) -> None:
         "→ permissions.allow/deny (coarse)")
 
 
-# ---- B2: hooks ↔ notify ----------------------------------------------------
+# ---- B2: hooks ↔ hooks.json / notify ----------------------------------------
+# Codex has a Claude-style hooks system now (~/.codex/hooks.json with the
+# same event names and the same {matcher, hooks:[{type:"command",...}]}
+# shape), so shared events translate almost verbatim. Claude's
+# `Notification` event has no Codex hook equivalent but maps onto the
+# legacy `notify` program. Non-command hook types (http, mcp_tool, prompt,
+# agent) and either side's exclusive events are dropped with notes —
+# that residual loss is why this stays Tier B.
+
+HOOK_EVENTS_SHARED_CODEX = (
+    "SessionStart", "SubagentStart", "UserPromptSubmit", "PreToolUse",
+    "PermissionRequest", "PostToolUse", "PreCompact", "PostCompact",
+    "SubagentStop", "Stop",
+)
+
 
 def _detect_claude_notify_hook(ctx: Ctx) -> bool:
-    s = load_claude_settings(ctx.src_root)
-    hooks = s.get("hooks") or {}
-    return any(k in hooks for k in ("Notification", "Stop"))
+    return bool(load_claude_settings(ctx.src_root).get("hooks"))
 
 
 def _preview_claude_notify_hook(ctx: Ctx) -> str:
-    s = load_claude_settings(ctx.src_root)
-    hooks = s.get("hooks") or {}
-    kinds = [k for k in ("Notification", "Stop") if k in hooks]
-    other = [k for k in hooks if k not in ("Notification", "Stop")]
-    msg = f"hooks: {', '.join(kinds)} → notify"
+    hooks = load_claude_settings(ctx.src_root).get("hooks") or {}
+    shared = [k for k in hooks if k in HOOK_EVENTS_SHARED_CODEX]
+    other = [k for k in hooks
+             if k not in HOOK_EVENTS_SHARED_CODEX and k != "Notification"]
+    parts = []
+    if shared:
+        parts.append(f"hooks: {', '.join(shared)} → .codex/hooks.json")
+    if "Notification" in hooks:
+        parts.append("Notification → notify")
+    msg = "; ".join(parts) or "hooks: (no translatable events)"
     if other:
-        msg += f". DROPPED hook types: {', '.join(other)}"
+        msg += f". DROPPED events: {', '.join(other)}"
     return msg
 
 
@@ -1584,23 +2029,119 @@ def _extract_first_command(entries: list) -> list[str] | None:
     return None
 
 
+def _command_hooks_only(ctx: Ctx, event: str, grp: dict,
+                        source: str) -> list[dict]:
+    """Filter one hook group down to command-type hooks, keeping the
+    fields both tools understand. Non-command hooks are noted."""
+    out: list[dict] = []
+    for h in grp.get("hooks") or []:
+        if h.get("type") == "command" and h.get("command"):
+            kept = {"type": "command", "command": h["command"]}
+            for k in ("timeout", "statusMessage"):
+                if h.get(k):
+                    kept[k] = h[k]
+            out.append(kept)
+        else:
+            ctx.report.notes.append(
+                f"{source}:{event}: non-command hook "
+                f"(type={h.get('type')!r}) not translated")
+    return out
+
+
 def _apply_claude_notify_hook(ctx: Ctx) -> None:
     s = load_claude_settings(ctx.src_root)
     hooks = s.get("hooks") or {}
-    cmd = _extract_first_command(hooks.get("Notification") or hooks.get("Stop"))
-    if not cmd:
-        return
-    dst = ctx.dst_root / "config.toml"
-    existing = load_toml(dst) if dst.exists() else {}
-    existing["notify"] = cmd
-    write_text(ctx, dst, render_toml(existing))
-    ctx.report.migrated_lossy.append(
-        "hooks.Notification/Stop → config.toml:notify "
-        "(wrapped via /bin/sh -c; matcher patterns dropped)")
-    other = [k for k in hooks if k not in ("Notification", "Stop")]
-    for k in other:
-        ctx.report.skipped_unmappable.append(
-            f"hooks.{k} (no Codex equivalent — PreToolUse/PostToolUse/etc. are Claude-only)")
+
+    # Shared events → hooks.json (near-verbatim, matchers included).
+    dst_hooks = ctx.dst_root / "hooks.json"
+    existing_hooks = load_json(dst_hooks) if (ctx.merge and dst_hooks.exists()) else {}
+    out = existing_hooks.setdefault("hooks", {})
+    migrated_events: list[str] = []
+    for event in HOOK_EVENTS_SHARED_CODEX:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        for grp in groups:
+            if not isinstance(grp, dict):
+                continue
+            kept = _command_hooks_only(ctx, event, grp, "hooks")
+            if not kept:
+                continue
+            entry: dict[str, Any] = {"hooks": kept}
+            if grp.get("matcher"):
+                entry["matcher"] = grp["matcher"]
+            out.setdefault(event, []).append(entry)
+            if event not in migrated_events:
+                migrated_events.append(event)
+    if migrated_events:
+        write_text(ctx, dst_hooks, json.dumps(existing_hooks, indent=2) + "\n")
+        ctx.report.migrated_lossy.append(
+            f"hooks ({', '.join(migrated_events)}) → .codex/hooks.json "
+            "(command hooks only)")
+
+    # Notification → legacy notify program.
+    cmd = _extract_first_command(hooks.get("Notification"))
+    if cmd:
+        dst = ctx.dst_root / "config.toml"
+        existing = load_toml(dst) if dst.exists() else {}
+        existing["notify"] = cmd
+        write_text(ctx, dst, render_toml(existing))
+        ctx.report.migrated_lossy.append(
+            "hooks.Notification → config.toml:notify "
+            "(wrapped via /bin/sh -c; matcher patterns dropped)")
+
+    for k in hooks:
+        if k not in HOOK_EVENTS_SHARED_CODEX and k != "Notification":
+            ctx.report.skipped_unmappable.append(
+                f"hooks.{k} (no Codex hook event equivalent)")
+
+
+def _detect_codex_hooks(ctx: Ctx) -> bool:
+    return bool(load_json(ctx.src_root / "hooks.json").get("hooks"))
+
+
+def _preview_codex_hooks(ctx: Ctx) -> str:
+    hooks = load_json(ctx.src_root / "hooks.json").get("hooks") or {}
+    shared = [k for k in hooks if k in HOOK_EVENTS_SHARED_CODEX]
+    other = [k for k in hooks if k not in HOOK_EVENTS_SHARED_CODEX]
+    msg = f"hooks.json: {', '.join(shared) or '(none)'} → settings.json:hooks"
+    if other:
+        msg += f". DROPPED events: {', '.join(other)}"
+    return msg
+
+
+def _apply_codex_hooks(ctx: Ctx) -> None:
+    hooks = load_json(ctx.src_root / "hooks.json").get("hooks") or {}
+    dst = ctx.dst_root / "settings.json"
+    existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+    out = existing.setdefault("hooks", {})
+    migrated_events: list[str] = []
+    for event, groups in hooks.items():
+        if event not in HOOK_EVENTS_SHARED_CODEX:
+            ctx.report.skipped_unmappable.append(
+                f"hooks.json:{event} (no Claude hook event equivalent)")
+            continue
+        for grp in groups if isinstance(groups, list) else []:
+            if not isinstance(grp, dict):
+                continue
+            kept = _command_hooks_only(ctx, event, grp, "hooks.json")
+            if any(h.get("commandWindows") for h in grp.get("hooks") or []):
+                ctx.report.notes.append(
+                    f"hooks.json:{event}: commandWindows variants dropped "
+                    "(Claude hooks have no Windows-specific command field)")
+            if not kept:
+                continue
+            entry: dict[str, Any] = {"hooks": kept}
+            if grp.get("matcher"):
+                entry["matcher"] = grp["matcher"]
+            out.setdefault(event, []).append(entry)
+            if event not in migrated_events:
+                migrated_events.append(event)
+    if migrated_events:
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+        ctx.report.migrated_lossy.append(
+            f"hooks.json ({', '.join(migrated_events)}) → settings.json:hooks "
+            "(command hooks only)")
 
 
 def _detect_codex_notify(ctx: Ctx) -> bool:
@@ -1619,7 +2160,13 @@ def _apply_codex_notify(ctx: Ctx) -> None:
     if not cmd:
         return
     if isinstance(cmd, list):
-        cmd_str = " ".join(cmd)
+        argv = [str(c) for c in cmd]
+        if len(argv) == 3 and argv[:2] == ["/bin/sh", "-c"]:
+            # Unwrap the shell wrapping a claude→codex migration added, so
+            # the hook command round-trips to its original form.
+            cmd_str = argv[2]
+        else:
+            cmd_str = shlex.join(argv)
     else:
         cmd_str = str(cmd)
     dst = ctx.dst_root / "settings.json"
@@ -1732,52 +2279,32 @@ def _apply_claude_agents(ctx: Ctx) -> None:
             f"agents/{rel} → agents/{out_name} (Codex custom agent){suffix}")
 
 
-# ---- B4: skills → prompts (one-way) ---------------------------------------
-
-def _detect_claude_skills(ctx: Ctx) -> bool:
-    p = ctx.src_root / "skills"
-    return p.is_dir() and any(p.glob("*/SKILL.md"))
-
-
-def _preview_claude_skills(ctx: Ctx) -> str:
-    n = sum(1 for _ in (ctx.src_root / "skills").glob("*/SKILL.md"))
-    return f"{n} skill(s) → prompts/skill-*.md (flattened; loses skill-discovery + assets)"
-
-
-def _apply_claude_skills(ctx: Ctx) -> None:
-    src_dir = ctx.src_root / "skills"
-    dst_dir = ctx.dst_root / "prompts"
-    for skill_md in sorted(src_dir.glob("*/SKILL.md")):
-        skill_name = skill_md.parent.name
-        out_name = f"skill-{skill_name}.md"
-        body, fm = strip_frontmatter(skill_md.read_text(encoding="utf-8"))
-        header = f"<!-- Converted from Claude skill: skills/{skill_name}/ -->\n"
-        if fm:
-            header += (f"<!-- Original frontmatter: "
-                       f"{json.dumps(fm, ensure_ascii=False)} -->\n")
-        # Note any non-SKILL.md assets in the skill dir.
-        assets = [p for p in skill_md.parent.rglob("*")
-                  if p.is_file() and p.name != "SKILL.md"]
-        if assets:
-            header += (f"<!-- Skill bundled {len(assets)} asset file(s); "
-                       "not migrated. See original skill dir. -->\n")
-        header += "\n"
-        write_text(ctx, dst_dir / out_name, header + body)
-        ctx.report.migrated_lossy.append(
-            f"skills/{skill_name}/ → prompts/{out_name} "
-            f"(lossy: assets not migrated)")
-
-
 # ---- B5: codex profiles → ~/.claude/profiles/*.json -----------------------
+# Codex 0.134 moved profiles out of config.toml: each profile is now its
+# own `<name>.config.toml` next to config.toml, and the legacy inline
+# `[profiles.*]` tables are rejected. We read both shapes (old configs
+# still exist in the wild) and materialize each as a standalone Claude
+# settings file.
+
+def _codex_read_profiles(root: Path) -> dict[str, dict]:
+    profiles: dict[str, dict] = {}
+    cfg = load_toml(root / "config.toml")
+    for name, override in (cfg.get("profiles") or {}).items():
+        if isinstance(override, dict):
+            profiles[name] = override
+    for f in sorted(root.glob("*.config.toml")):
+        data = load_toml(f)
+        if data:
+            profiles[f.name[:-len(".config.toml")]] = data
+    return profiles
+
 
 def _detect_codex_profiles(ctx: Ctx) -> bool:
-    c = load_toml(ctx.src_root / "config.toml")
-    return bool(c.get("profiles"))
+    return bool(_codex_read_profiles(ctx.src_root))
 
 
 def _preview_codex_profiles(ctx: Ctx) -> str:
-    c = load_toml(ctx.src_root / "config.toml")
-    names = list((c.get("profiles") or {}).keys())
+    names = list(_codex_read_profiles(ctx.src_root))
     return (f"{len(names)} Codex profile(s): {', '.join(names)} → "
             "~/.claude/profiles/*.settings.json (no Claude profile runtime; "
             "swap manually)")
@@ -1786,7 +2313,7 @@ def _preview_codex_profiles(ctx: Ctx) -> str:
 def _apply_codex_profiles(ctx: Ctx) -> None:
     c = load_toml(ctx.src_root / "config.toml")
     base = {k: v for k, v in c.items() if k != "profiles"}
-    profiles = c.get("profiles") or {}
+    profiles = _codex_read_profiles(ctx.src_root)
     out_dir = ctx.dst_root / "profiles"
     for name, override in profiles.items():
         merged = {**base, **(override if isinstance(override, dict) else {})}
@@ -1816,36 +2343,16 @@ def _apply_codex_profiles(ctx: Ctx) -> None:
         _ = sub_report  # unused but kept to mirror structure
 
 
-# ---- B6/7/8/9: claude/codex subagents, skills, commands, prompts → cursor rules ----
-# Cursor has no subagent runtime, no skills system, and no slash-command
-# concept. The next best thing is a Cursor rule (`.cursor/rules/*.mdc`)
-# with `alwaysApply: false` so the content is loadable when relevant but
-# not auto-prepended. The result is lossy in the same way as
-# agents→codex prompts: the invocation/runtime semantics don't survive,
-# only the text content does.
+# ---- B6: claude subagents → native cursor subagents ------------------------
+# Cursor 2.4+ has a native subagent runtime: markdown files under
+# <cursor_root>/agents/ with name/description/model(+bracket effort)/
+# readonly/is_background frontmatter. name/description/model/effort/
+# background translate; Claude-only fields (tools, hooks, memory,
+# skills, maxTurns, …) have no Cursor equivalent — that residual loss is
+# why this stays Tier B. (Skills and slash commands are NOT in this
+# bucket anymore: skills copy verbatim and commands become
+# slash-invocable Cursor skills, both Tier A.)
 
-def _flatten_dir_to_cursor_rules(ctx: Ctx, src_subdir: str, name_prefix: str,
-                                  fallback_desc_tpl: str, lossy_note: str,
-                                  always_apply: bool = False) -> None:
-    """Shared body for the four 'flatten claude/codex source dir into Cursor
-    rules' lossy options. Writes one `<prefix>-<name>.mdc` per source file
-    under `<dst_root>/rules/`."""
-    src_dir = ctx.src_root / src_subdir
-    rules_dir = ctx.dst_root / "rules"
-    for f in sorted(src_dir.rglob("*.md")):
-        rel = f.relative_to(src_dir)
-        stem = rel.as_posix().replace("/", "-").rsplit(".", 1)[0]
-        out_name = f"{name_prefix}-{stem}.mdc"
-        body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
-        desc = (fm or {}).get("description") or fallback_desc_tpl.format(name=stem)
-        front_fm = {"description": desc, "alwaysApply": str(always_apply).lower()}
-        write_text(ctx, rules_dir / out_name,
-                   make_frontmatter(front_fm) + body.lstrip("\n"))
-        ctx.report.migrated_lossy.append(
-            f"{src_subdir}/{rel} → rules/{out_name} ({lossy_note})")
-
-
-# ---- agents → cursor rules ----
 def _detect_claude_agents_cursor(ctx: Ctx) -> bool:
     p = ctx.src_root / "agents"
     return p.is_dir() and any(p.rglob("*.md"))
@@ -1853,91 +2360,174 @@ def _detect_claude_agents_cursor(ctx: Ctx) -> bool:
 
 def _preview_claude_agents_cursor(ctx: Ctx) -> str:
     n = sum(1 for _ in (ctx.src_root / "agents").rglob("*.md"))
-    return (f"{n} subagent file(s) → .cursor/rules/agent-*.mdc "
-            "(alwaysApply:false; loses subagent runtime)")
+    return (f"{n} subagent file(s) → .cursor/agents/*.md (native Cursor "
+            "subagents; tools/hooks/memory fields don't carry)")
+
+
+_CLAUDE_AGENT_FIELDS_CURSOR = {
+    "name", "description", "model", "effort", "background", "permissionMode",
+}
 
 
 def _apply_claude_agents_cursor(ctx: Ctx) -> None:
-    _flatten_dir_to_cursor_rules(
-        ctx, src_subdir="agents", name_prefix="agent",
-        fallback_desc_tpl="Migrated from Claude subagent {name}",
-        lossy_note="lossy: no subagent runtime in Cursor",
-    )
-
-
-# ---- skills → cursor rules ----
-def _detect_claude_skills_cursor(ctx: Ctx) -> bool:
-    p = ctx.src_root / "skills"
-    return p.is_dir() and any(p.glob("*/SKILL.md"))
-
-
-def _preview_claude_skills_cursor(ctx: Ctx) -> str:
-    n = sum(1 for _ in (ctx.src_root / "skills").glob("*/SKILL.md"))
-    return (f"{n} skill(s) → .cursor/rules/skill-*.mdc "
-            "(alwaysApply:false; bundled assets are not migrated)")
-
-
-def _apply_claude_skills_cursor(ctx: Ctx) -> None:
-    src_dir = ctx.src_root / "skills"
-    rules_dir = ctx.dst_root / "rules"
-    for skill_md in sorted(src_dir.glob("*/SKILL.md")):
-        name = skill_md.parent.name
-        body, fm = strip_frontmatter(skill_md.read_text(encoding="utf-8"))
-        desc = (fm or {}).get("description") or f"Migrated from Claude skill {name}"
-        front = make_frontmatter({"description": desc, "alwaysApply": "false"})
-        # Note bundled assets so the user knows what isn't migrated.
-        assets = [p for p in skill_md.parent.rglob("*")
-                  if p.is_file() and p.name != "SKILL.md"]
-        prelude = ""
-        if assets:
-            prelude = (f"<!-- Original skill bundled {len(assets)} asset "
-                       f"file(s); not migrated. -->\n\n")
-        write_text(ctx, rules_dir / f"skill-{name}.mdc",
-                   front + prelude + body.lstrip("\n"))
+    src_dir = ctx.src_root / "agents"
+    dst_dir = ctx.dst_root / "agents"
+    for f in sorted(src_dir.rglob("*.md")):
+        if f.stem == "README":
+            continue
+        rel = f.relative_to(src_dir)
+        body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+        fm = fm or {}
+        name = safe_agent_name(fm.get("name") or f.stem)
+        out_fm: dict[str, str] = {
+            "name": name,
+            "description": fm.get("description")
+            or f"Migrated from Claude subagent {name}.",
+        }
+        model, effort = fm.get("model"), fm.get("effort")
+        if model and effort:
+            # Cursor folds effort into the model id: `model[effort=high]`.
+            out_fm["model"] = f"{model}[effort={effort}]"
+        elif model:
+            out_fm["model"] = model
+        if str(fm.get("background", "")).lower() == "true":
+            out_fm["is_background"] = "true"
+        if fm.get("permissionMode") in ("readOnly", "plan"):
+            out_fm["readonly"] = "true"
+        dropped = sorted(k for k in fm if k not in _CLAUDE_AGENT_FIELDS_CURSOR)
+        if effort and not model:
+            dropped.append("effort (needs an explicit model in Cursor)")
+        if dropped:
+            body = body.rstrip() + (
+                "\n\n## Manual migration notes\n\n"
+                "- Claude subagent fields with no Cursor equivalent were "
+                "dropped: " + ", ".join(f"`{d}`" for d in dropped) + ".\n")
+        write_text(ctx, dst_dir / f"{name}.md",
+                   make_frontmatter(out_fm) + body.rstrip() + "\n")
+        suffix = f" (dropped: {', '.join(dropped)})" if dropped else ""
         ctx.report.migrated_lossy.append(
-            f"skills/{name}/ → rules/skill-{name}.mdc "
-            f"(lossy: no skills runtime in Cursor; "
-            f"{len(assets)} asset file(s) not migrated)")
+            f"agents/{rel} → agents/{name}.md (native Cursor subagent){suffix}")
 
 
-# ---- claude commands → cursor rules ----
-def _detect_claude_commands_cursor(ctx: Ctx) -> bool:
-    p = ctx.src_root / "commands"
-    return p.is_dir() and any(p.rglob("*.md"))
+# ---- B7: claude hooks ↔ cursor hooks.json ----------------------------------
+# Cursor has a real hooks system (<cursor_root>/hooks.json, `version: 1`,
+# camelCase events, flat entry lists). A subset of events exists on both
+# sides; command-type hooks translate, everything else is dropped with a
+# note. Claude matchers have no Cursor equivalent in the translated shape,
+# and Cursor's prompt-type / shell-interception hooks have no Claude
+# equivalent, so both directions are Tier B.
+
+HOOK_EVENTS_CLAUDE_TO_CURSOR = {
+    "PreToolUse": "preToolUse",
+    "PostToolUse": "postToolUse",
+    "SessionStart": "sessionStart",
+    "SessionEnd": "sessionEnd",
+    "Stop": "stop",
+    "PreCompact": "preCompact",
+    "SubagentStart": "subagentStart",
+    "SubagentStop": "subagentStop",
+    "UserPromptSubmit": "beforeSubmitPrompt",
+}
+HOOK_EVENTS_CURSOR_TO_CLAUDE = {v: k for k, v in
+                                HOOK_EVENTS_CLAUDE_TO_CURSOR.items()}
 
 
-def _preview_claude_commands_cursor(ctx: Ctx) -> str:
-    n = sum(1 for _ in (ctx.src_root / "commands").rglob("*.md"))
-    return (f"{n} slash command(s) → .cursor/rules/command-*.mdc "
-            "(alwaysApply:false; not invocable like Claude slash commands)")
+def _detect_claude_hooks_cursor(ctx: Ctx) -> bool:
+    s = load_claude_settings(ctx.src_root)
+    return bool(s.get("hooks"))
 
 
-def _apply_claude_commands_cursor(ctx: Ctx) -> None:
-    _flatten_dir_to_cursor_rules(
-        ctx, src_subdir="commands", name_prefix="command",
-        fallback_desc_tpl="Slash command: /{name}",
-        lossy_note="lossy: Cursor rules aren't invocable like /commands",
-    )
+def _preview_claude_hooks_cursor(ctx: Ctx) -> str:
+    hooks = load_claude_settings(ctx.src_root).get("hooks") or {}
+    mappable = [k for k in hooks if k in HOOK_EVENTS_CLAUDE_TO_CURSOR]
+    dropped = [k for k in hooks if k not in HOOK_EVENTS_CLAUDE_TO_CURSOR]
+    msg = f"hooks: {', '.join(mappable) or '(none)'} → .cursor/hooks.json"
+    if dropped:
+        msg += f". DROPPED events: {', '.join(dropped)}"
+    return msg
 
 
-# ---- codex prompts → cursor rules ----
-def _detect_codex_prompts_cursor(ctx: Ctx) -> bool:
-    p = ctx.src_root / "prompts"
-    return p.is_dir() and any(p.rglob("*.md"))
+def _apply_claude_hooks_cursor(ctx: Ctx) -> None:
+    hooks = load_claude_settings(ctx.src_root).get("hooks") or {}
+    dst = ctx.dst_root / "hooks.json"
+    existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+    existing.setdefault("version", 1)
+    out = existing.setdefault("hooks", {})
+    migrated = 0
+    for event, groups in hooks.items():
+        cursor_event = HOOK_EVENTS_CLAUDE_TO_CURSOR.get(event)
+        if not cursor_event:
+            ctx.report.skipped_unmappable.append(
+                f"hooks.{event} (no Cursor hook event equivalent)")
+            continue
+        for grp in groups if isinstance(groups, list) else []:
+            if not isinstance(grp, dict):
+                continue
+            if grp.get("matcher"):
+                ctx.report.notes.append(
+                    f"hooks.{event}: matcher {grp['matcher']!r} dropped "
+                    "(Cursor hook matchers work differently — review)")
+            for h in grp.get("hooks") or []:
+                if h.get("type") == "command" and h.get("command"):
+                    entry: dict[str, Any] = {"command": h["command"]}
+                    if h.get("timeout"):
+                        entry["timeout"] = h["timeout"]
+                    out.setdefault(cursor_event, []).append(entry)
+                    migrated += 1
+                else:
+                    ctx.report.notes.append(
+                        f"hooks.{event}: non-command hook "
+                        f"(type={h.get('type')!r}) not translated")
+    if migrated:
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+        ctx.report.migrated_lossy.append(
+            f"hooks → .cursor/hooks.json ({migrated} command hook(s); "
+            "matchers and non-command hooks dropped)")
 
 
-def _preview_codex_prompts_cursor(ctx: Ctx) -> str:
-    n = sum(1 for _ in (ctx.src_root / "prompts").rglob("*.md"))
-    return (f"{n} prompt(s) → .cursor/rules/prompt-*.mdc "
-            "(alwaysApply:false; not on-demand invocable like Codex prompts)")
+def _detect_cursor_hooks(ctx: Ctx) -> bool:
+    return bool(load_json(ctx.src_root / "hooks.json").get("hooks"))
 
 
-def _apply_codex_prompts_cursor(ctx: Ctx) -> None:
-    _flatten_dir_to_cursor_rules(
-        ctx, src_subdir="prompts", name_prefix="prompt",
-        fallback_desc_tpl="Codex prompt: {name}",
-        lossy_note="lossy: Cursor rules aren't on-demand invocable",
-    )
+def _preview_cursor_hooks(ctx: Ctx) -> str:
+    hooks = load_json(ctx.src_root / "hooks.json").get("hooks") or {}
+    mappable = [k for k in hooks if k in HOOK_EVENTS_CURSOR_TO_CLAUDE]
+    dropped = [k for k in hooks if k not in HOOK_EVENTS_CURSOR_TO_CLAUDE]
+    msg = f"hooks.json: {', '.join(mappable) or '(none)'} → settings.json:hooks"
+    if dropped:
+        msg += f". DROPPED events: {', '.join(dropped)}"
+    return msg
+
+
+def _apply_cursor_hooks(ctx: Ctx) -> None:
+    hooks = load_json(ctx.src_root / "hooks.json").get("hooks") or {}
+    dst = ctx.dst_root / "settings.json"
+    existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+    out = existing.setdefault("hooks", {})
+    migrated = 0
+    for event, entries in hooks.items():
+        claude_event = HOOK_EVENTS_CURSOR_TO_CLAUDE.get(event)
+        if not claude_event:
+            ctx.report.skipped_unmappable.append(
+                f"hooks.json:{event} (no Claude hook event equivalent)")
+            continue
+        for e in entries if isinstance(entries, list) else []:
+            if not isinstance(e, dict) or not e.get("command"):
+                continue
+            if e.get("type") == "prompt":
+                ctx.report.notes.append(
+                    f"hooks.json:{event}: prompt-type hook not translated")
+                continue
+            h: dict[str, Any] = {"type": "command", "command": e["command"]}
+            if e.get("timeout"):
+                h["timeout"] = e["timeout"]
+            out.setdefault(claude_event, []).append({"hooks": [h]})
+            migrated += 1
+    if migrated:
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+        ctx.report.migrated_lossy.append(
+            f"hooks.json → settings.json:hooks ({migrated} command hook(s); "
+            "prompt-type hooks and Cursor-only events dropped)")
 
 
 # ---- Catalog ---------------------------------------------------------------
@@ -1964,14 +2554,38 @@ TIER_B: list[LossyOption] = [
         apply=_apply_codex_sandbox,
     ),
     LossyOption(
+        id="rules",
+        direction="codex->claude",
+        label="rules/*.rules → permissions Bash(...) patterns",
+        rationale=("Codex prefix rules map onto Claude Bash() permission "
+                   "patterns. Prefix semantics are approximated with :* "
+                   "suffixes; union pattern elements can't be translated."),
+        detect=_detect_codex_rules,
+        preview=_preview_codex_rules,
+        apply=_apply_codex_rules,
+    ),
+    LossyOption(
         id="hooks",
         direction="claude->codex",
-        label="hooks.Notification/Stop → notify",
-        rationale=("Codex `notify` covers a subset of Claude's hook events. "
-                   "Other hook types (PreToolUse, etc.) are dropped."),
+        label="hooks → .codex/hooks.json (+ Notification → notify)",
+        rationale=("Codex hooks share Claude's event names and shape, so "
+                   "command hooks on shared events translate near-verbatim. "
+                   "Notification maps to the legacy notify program; "
+                   "non-command hook types and Claude-only events drop."),
         detect=_detect_claude_notify_hook,
         preview=_preview_claude_notify_hook,
         apply=_apply_claude_notify_hook,
+    ),
+    LossyOption(
+        id="codex_hooks",
+        direction="codex->claude",
+        label="hooks.json → settings.json:hooks",
+        rationale=("Command hooks on shared events translate near-verbatim; "
+                   "commandWindows variants and non-command hook types are "
+                   "dropped."),
+        detect=_detect_codex_hooks,
+        preview=_preview_codex_hooks,
+        apply=_apply_codex_hooks,
     ),
     LossyOption(
         id="notify",
@@ -1994,16 +2608,6 @@ TIER_B: list[LossyOption] = [
         apply=_apply_claude_agents,
     ),
     LossyOption(
-        id="skills",
-        direction="claude->codex",
-        label="skills/ → prompts/skill-*.md",
-        rationale=("Codex has no skills system. SKILL.md becomes a flat prompt; "
-                   "bundled assets are not migrated and skill auto-discovery is lost."),
-        detect=_detect_claude_skills,
-        preview=_preview_claude_skills,
-        apply=_apply_claude_skills,
-    ),
-    LossyOption(
         id="profiles",
         direction="codex->claude",
         label="[profiles.*] → ~/.claude/profiles/*.settings.json",
@@ -2017,46 +2621,35 @@ TIER_B: list[LossyOption] = [
     LossyOption(
         id="agents_cursor",
         direction="claude->cursor",
-        label="agents/ → .cursor/rules/agent-*.mdc",
-        rationale=("Cursor has no subagent runtime. Each agent.md becomes a "
-                   "Cursor rule with alwaysApply:false — content survives, "
-                   "but subagent invocation semantics don't."),
+        label="agents/ → .cursor/agents/*.md (native Cursor subagents)",
+        rationale=("Cursor 2.4+ runs subagents natively. name/description/"
+                   "model/effort/background translate; Claude-only fields "
+                   "(tools, hooks, memory, skills, …) are dropped with notes."),
         detect=_detect_claude_agents_cursor,
         preview=_preview_claude_agents_cursor,
         apply=_apply_claude_agents_cursor,
     ),
     LossyOption(
-        id="skills_cursor",
+        id="hooks_cursor",
         direction="claude->cursor",
-        label="skills/ → .cursor/rules/skill-*.mdc",
-        rationale=("Cursor has no skills runtime. SKILL.md becomes a Cursor "
-                   "rule with alwaysApply:false; bundled assets are not "
-                   "migrated and auto-discovery is lost."),
-        detect=_detect_claude_skills_cursor,
-        preview=_preview_claude_skills_cursor,
-        apply=_apply_claude_skills_cursor,
+        label="hooks → .cursor/hooks.json",
+        rationale=("A subset of hook events exists on both sides; command "
+                   "hooks translate, matchers and Claude-only events are "
+                   "dropped."),
+        detect=_detect_claude_hooks_cursor,
+        preview=_preview_claude_hooks_cursor,
+        apply=_apply_claude_hooks_cursor,
     ),
     LossyOption(
-        id="commands_cursor",
-        direction="claude->cursor",
-        label="commands/ → .cursor/rules/command-*.mdc",
-        rationale=("Cursor has no slash-command equivalent. Commands become "
-                   "alwaysApply:false rules — content is loadable but won't "
-                   "be invokable as /commandname."),
-        detect=_detect_claude_commands_cursor,
-        preview=_preview_claude_commands_cursor,
-        apply=_apply_claude_commands_cursor,
-    ),
-    LossyOption(
-        id="prompts_cursor",
-        direction="codex->cursor",
-        label="prompts/ → .cursor/rules/prompt-*.mdc",
-        rationale=("Cursor has no on-demand prompt invocation. Codex prompts "
-                   "become alwaysApply:false rules — content is loadable but "
-                   "loses its on-demand semantics."),
-        detect=_detect_codex_prompts_cursor,
-        preview=_preview_codex_prompts_cursor,
-        apply=_apply_codex_prompts_cursor,
+        id="cursor_hooks",
+        direction="cursor->claude",
+        label="hooks.json → settings.json:hooks",
+        rationale=("Command hooks on shared events translate; Cursor "
+                   "prompt-type hooks and Cursor-only events (shell/MCP "
+                   "interception, tab hooks) are dropped."),
+        detect=_detect_cursor_hooks,
+        preview=_preview_cursor_hooks,
+        apply=_apply_cursor_hooks,
     ),
 ]
 
@@ -2110,6 +2703,8 @@ def preflight(ctx: Ctx, direction_key: str,
         a_items.append("instruction doc (CLAUDE.md ↔ AGENTS.md)")
     if (ctx.src_root / "commands").is_dir() or (ctx.src_root / "prompts").is_dir():
         a_items.append("slash commands ↔ prompts")
+    if _skill_dirs(ctx.src_root):
+        a_items.append("skills (shared Agent Skills format)")
     if (ctx.src_root / "settings.json").exists() or (ctx.src_root / "config.toml").exists():
         a_items.append("model + mcpServers + env + reasoning effort")
     for x in a_items:
@@ -2160,18 +2755,22 @@ def preflight(ctx: Ctx, direction_key: str,
 def run_claude_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     tier_a_docs_claude_to_codex(ctx)
     tier_a_commands_to_prompts(ctx)
+    tier_a_skills_copy(ctx)
     tier_a_settings_claude_to_codex(ctx)
     _run_lossy(ctx, lossy_decisions, "claude->codex")
 
     for sub in ("plugins",):
         p = ctx.src_root / sub
         if p.is_dir() and any(p.iterdir()):
-            ctx.report.skipped_unmappable.append(f"{sub}/ (Claude-only runtime)")
+            ctx.report.skipped_unmappable.append(
+                f"{sub}/ (Codex plugins use a different format — "
+                "reinstall via `codex plugin`)")
 
 
 def run_codex_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     tier_a_docs_codex_to_claude(ctx)
     tier_a_prompts_to_commands(ctx)
+    tier_a_skills_copy(ctx)
     tier_a_codex_agents_to_claude(ctx)
     tier_a_settings_codex_to_claude(ctx)
     _run_lossy(ctx, lossy_decisions, "codex->claude")
@@ -2379,8 +2978,9 @@ def main() -> int:
         if args.restore == "__latest__":
             backup_path = find_latest_backup()
             if not backup_path:
-                print("No backups found under ~/.claude/backups or "
-                      "~/.codex/backups.", file=sys.stderr)
+                print("No backups found under any tool's backups dir "
+                      "(~/.claude, ~/.codex, ~/.cursor, or ./.<tool>).",
+                      file=sys.stderr)
                 return 1
             print(f"Using latest backup: {backup_path}")
         else:
@@ -2393,6 +2993,11 @@ def main() -> int:
     # ---- Migrate mode ------------------------------------------------------
     apply_set = _csv_set(args.apply_lossy)
     skip_set = _csv_set(args.skip_lossy)
+    valid_ids = {o.id for o in TIER_B} | {"all"}
+    for flag, ids in (("--apply-lossy", apply_set), ("--skip-lossy", skip_set)):
+        for unknown in sorted((ids or set()) - valid_ids):
+            print(f"warn: {flag}: unknown Tier B id {unknown!r} — ignored. "
+                  f"Valid ids: {', '.join(sorted(valid_ids))}", file=sys.stderr)
     interactive = interactive_default and not (apply_set or skip_set)
 
     from_tool, to_tool = args.from_tool, args.to_tool

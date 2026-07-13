@@ -331,13 +331,29 @@ class CommandsRoundTripTests(FsTestBase):
         ctx = make_ctx(self.src, self.dst)
         m.tier_a_commands_to_prompts(ctx)
 
-        # description rides along in the meta comment; model + allowed-tools do not.
+        # description becomes native Codex prompt frontmatter;
+        # model + allowed-tools have no prompt equivalent.
         out = (self.dst / "prompts" / "foo.md").read_text()
-        _, parsed = m.meta_comment_to_frontmatter(out)
+        _, parsed = m.strip_frontmatter(out)
         self.assertEqual(parsed, {"description": "D"})
         self.assertNotIn("allowed-tools", out)
         self.assertTrue(any("model" in n and "allowed-tools" in n
                             for n in ctx.report.notes))
+
+    def test_legacy_meta_comment_prompts_still_convert(self):
+        # Prompts written by older migrator versions carry frontmatter in a
+        # migrator:meta comment instead of native frontmatter.
+        prompts = self.src / "prompts"
+        prompts.mkdir()
+        (prompts / "old.md").write_text(
+            '<!-- migrator:meta json={"description": "legacy"} -->\nbody\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_prompts_to_commands(ctx)
+
+        body, fm = m.strip_frontmatter(
+            (self.dst / "commands" / "old.md").read_text())
+        self.assertEqual(fm, {"description": "legacy"})
+        self.assertEqual(body.strip(), "body")
 
 
 class TierBPermissionsToSandboxTests(FsTestBase):
@@ -402,26 +418,179 @@ class TierBSandboxToPermissionsTests(FsTestBase):
         self.assertIn("WebFetch(*)", s["permissions"]["deny"])
 
 
+class PrefixRulesTests(FsTestBase):
+    """Claude Bash() permission patterns ↔ Codex Starlark prefix rules."""
+
+    def test_bash_rules_become_prefix_rules(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "permissions": {
+                "allow": ["Bash(git commit:*)", "Bash(npm run build:*)",
+                          "Read(*)"],
+                "ask": ["Bash(git push:*)"],
+                "deny": ["Bash(rm -rf:*)"],
+            }
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_permissions(ctx)
+
+        rules = (self.dst / "rules" / "default.rules").read_text()
+        self.assertIn(
+            'prefix_rule(pattern=["git", "commit"], decision="allow")', rules)
+        self.assertIn(
+            'prefix_rule(pattern=["npm", "run", "build"], decision="allow")',
+            rules)
+        self.assertIn(
+            'prefix_rule(pattern=["git", "push"], decision="prompt")', rules)
+        self.assertIn(
+            'prefix_rule(pattern=["rm", "-rf"], decision="forbidden")', rules)
+        # Read() isn't a shell command — no prefix rule for it.
+        self.assertNotIn("Read", rules)
+
+    def test_existing_smart_approval_rules_are_appended_not_replaced(self):
+        (self.dst / "rules").mkdir()
+        (self.dst / "rules" / "default.rules").write_text(
+            'prefix_rule(pattern=["vercel", "deploy"], decision="allow")\n')
+        (self.src / "settings.json").write_text(json.dumps({
+            "permissions": {"allow": ["Bash(git status:*)"]}
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_permissions(ctx)
+
+        rules = (self.dst / "rules" / "default.rules").read_text()
+        self.assertIn('pattern=["vercel", "deploy"]', rules)
+        self.assertIn('pattern=["git", "status"]', rules)
+
+    def test_prefix_rules_become_claude_permissions(self):
+        (self.src / "rules").mkdir()
+        (self.src / "rules" / "default.rules").write_text(
+            'prefix_rule(pattern=["npm", "run", "build"], decision="allow")\n'
+            'prefix_rule(\n'
+            '    pattern = ["gh", "pr", "view"],\n'
+            '    decision = "prompt",\n'
+            '    justification = "PR views need approval",\n'
+            ')\n'
+            'prefix_rule(pattern=["rm"], decision="forbidden")\n'
+            'prefix_rule(pattern=["gh", ["view", "list"]])\n')
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_codex_rules(ctx)
+
+        perms = json.loads(
+            (self.dst / "settings.json").read_text())["permissions"]
+        self.assertIn("Bash(npm run build:*)", perms["allow"])
+        self.assertIn("Bash(gh pr view:*)", perms["ask"])
+        self.assertIn("Bash(rm:*)", perms["deny"])
+        # Union pattern elements can't be translated — noted instead.
+        self.assertTrue(any("union" in n for n in ctx.report.notes))
+
+    def test_round_trip_preserves_rules(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "permissions": {"allow": ["Bash(git commit:*)"]}
+        }))
+        mid = self.tmp / "mid"
+        mid.mkdir()
+        m._apply_claude_permissions(make_ctx(self.src, mid))
+        ctx_back = make_ctx(mid, self.dst)
+        m._apply_codex_rules(ctx_back)
+        perms = json.loads(
+            (self.dst / "settings.json").read_text())["permissions"]
+        self.assertIn("Bash(git commit:*)", perms["allow"])
+
+
+class McpHttpTransportTests(FsTestBase):
+    """Codex speaks streamable HTTP MCP now — URL servers carry over."""
+
+    def test_claude_http_server_maps_to_codex_url(self):
+        rep = m.Report(direction="t")
+        out = m._normalize_mcp_claude_to_codex(
+            "gh", {"type": "http", "url": "https://x.test/mcp",
+                   "headers": {"Authorization": "Bearer t"}}, rep)
+        self.assertEqual(out["url"], "https://x.test/mcp")
+        self.assertEqual(out["http_headers"]["Authorization"], "Bearer t")
+
+    def test_cursor_untyped_url_server_maps_to_codex(self):
+        # Cursor omits `type` for remote servers; a bare url means HTTP.
+        rep = m.Report(direction="t")
+        out = m._normalize_mcp_claude_to_codex(
+            "r", {"url": "https://r.test/mcp"}, rep)
+        self.assertEqual(out, {"url": "https://r.test/mcp"})
+
+    def test_sse_and_ws_still_skipped_for_codex(self):
+        rep = m.Report(direction="t")
+        self.assertIsNone(m._normalize_mcp_claude_to_codex(
+            "s", {"type": "sse", "url": "https://s.test"}, rep))
+        self.assertIsNone(m._normalize_mcp_claude_to_codex(
+            "w", {"type": "ws", "url": "wss://w.test"}, rep))
+        self.assertEqual(len(rep.skipped_unmappable), 2)
+
+    def test_codex_url_server_maps_to_claude_http(self):
+        out = m._normalize_mcp_codex_to_claude(
+            {"url": "https://x.test/mcp",
+             "http_headers": {"X-K": "v"}})
+        self.assertEqual(out["type"], "http")
+        self.assertEqual(out["url"], "https://x.test/mcp")
+        self.assertEqual(out["headers"], {"X-K": "v"})
+
+    def test_codex_url_server_maps_to_cursor(self):
+        out = m._native_mcp_from_codex(
+            "x", {"url": "https://x.test/mcp"})
+        self.assertEqual(out, {"url": "https://x.test/mcp"})
+
+
 class TierBHooksNotifyTests(FsTestBase):
-    def test_claude_notification_hook_becomes_notify(self):
+    def test_claude_hooks_split_between_hooks_json_and_notify(self):
         (self.src / "settings.json").write_text(json.dumps({
             "hooks": {
                 "Notification": [{"hooks": [
                     {"type": "command", "command": "say hello"}
                 ]}],
-                "PreToolUse": [{"hooks": [
-                    {"type": "command", "command": "echo pre"}
+                "PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "echo pre", "timeout": 30}
+                ]}],
+                "FileChanged": [{"hooks": [
+                    {"type": "command", "command": "echo changed"}
                 ]}],
             }
         }))
         ctx = make_ctx(self.src, self.dst)
         m._apply_claude_notify_hook(ctx)
 
+        # Notification → legacy notify argv (wrapped via /bin/sh -c).
         cfg = tomllib.loads((self.dst / "config.toml").read_text())
-        # Codex notify takes an argv list; we wrap the shell string in /bin/sh -c.
         self.assertEqual(cfg["notify"], ["/bin/sh", "-c", "say hello"])
-        self.assertTrue(any("PreToolUse" in s
+
+        # PreToolUse translates near-verbatim into Codex hooks.json.
+        hooks = json.loads((self.dst / "hooks.json").read_text())["hooks"]
+        entry = hooks["PreToolUse"][0]
+        self.assertEqual(entry["matcher"], "Bash")
+        self.assertEqual(entry["hooks"][0]["command"], "echo pre")
+        self.assertEqual(entry["hooks"][0]["timeout"], 30)
+
+        # Claude-only events are reported, not silently dropped.
+        self.assertTrue(any("FileChanged" in s
                             for s in ctx.report.skipped_unmappable))
+
+    def test_codex_hooks_json_becomes_claude_hooks(self):
+        (self.src / "hooks.json").write_text(json.dumps({
+            "hooks": {
+                "Stop": [{"hooks": [
+                    {"type": "command", "command": "./done.sh"}
+                ]}],
+                "PostToolUse": [{"hooks": [
+                    {"type": "command", "command": "fmt",
+                     "commandWindows": "fmt.exe"}
+                ]}],
+            }
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_codex_hooks(ctx)
+
+        s = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(
+            s["hooks"]["Stop"][0]["hooks"][0]["command"], "./done.sh")
+        self.assertEqual(
+            s["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "fmt")
+        # Windows command variants have no Claude equivalent — noted.
+        self.assertTrue(any("commandWindows" in n for n in ctx.report.notes))
 
     def test_codex_notify_becomes_notification_hook(self):
         (self.src / "config.toml").write_text(
@@ -431,6 +600,26 @@ class TierBHooksNotifyTests(FsTestBase):
 
         s = json.loads((self.dst / "settings.json").read_text())
         self.assertIn("Notification", s["hooks"])
+
+    def test_notify_round_trip_unwraps_shell_wrapper(self):
+        # claude→codex wraps hook commands as ["/bin/sh", "-c", CMD];
+        # codex→claude must unwrap back to CMD, not " ".join() the argv.
+        (self.src / "config.toml").write_text(
+            'notify = ["/bin/sh", "-c", "say \\"all done\\""]\n')
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_codex_notify(ctx)
+        s = json.loads((self.dst / "settings.json").read_text())
+        cmd = s["hooks"]["Notification"][0]["hooks"][0]["command"]
+        self.assertEqual(cmd, 'say "all done"')
+
+    def test_notify_argv_is_shell_quoted(self):
+        (self.src / "config.toml").write_text(
+            'notify = ["notify-send", "job done"]\n')
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_codex_notify(ctx)
+        s = json.loads((self.dst / "settings.json").read_text())
+        cmd = s["hooks"]["Notification"][0]["hooks"][0]["command"]
+        self.assertEqual(cmd, "notify-send 'job done'")
 
 
 class TierBProfilesTests(FsTestBase):
@@ -445,6 +634,20 @@ class TierBProfilesTests(FsTestBase):
         s = json.loads((self.dst / "profiles" / "deep.settings.json").read_text())
         self.assertEqual(s["model"], "gpt-5")  # inherited from base config
         self.assertEqual(s["effortLevel"], "xhigh")
+
+    def test_file_based_profiles_are_read(self):
+        # Codex 0.134+ keeps each profile in its own <name>.config.toml.
+        (self.src / "config.toml").write_text('model = "gpt-5"\n')
+        (self.src / "fast.config.toml").write_text(
+            'model = "gpt-5-mini"\nmodel_reasoning_effort = "low"\n')
+        ctx = make_ctx(self.src, self.dst)
+        self.assertTrue(m._detect_codex_profiles(ctx))
+        m._apply_codex_profiles(ctx)
+
+        s = json.loads(
+            (self.dst / "profiles" / "fast.settings.json").read_text())
+        self.assertEqual(s["model"], "gpt-5-mini")
+        self.assertEqual(s["effortLevel"], "low")
 
 
 class TierBAgentsAndSkillsTests(FsTestBase):
@@ -500,19 +703,52 @@ class TierBAgentsAndSkillsTests(FsTestBase):
         self.assertIn("Do a review.", body)
         self.assertIn("sandbox_mode", body)
 
-    def test_skill_flattens_and_notes_assets(self):
+    def test_skill_copies_verbatim_with_assets(self):
+        # All three tools share the Agent Skills format, so skills are a
+        # Tier A verbatim tree copy — frontmatter, body, and assets survive.
         sk = self.src / "skills" / "myskill"
-        sk.mkdir(parents=True)
-        (sk / "SKILL.md").write_text(
-            "---\nname: myskill\n---\nSkill content.\n")
-        (sk / "asset.txt").write_text("asset bytes")
+        (sk / "scripts").mkdir(parents=True)
+        skill_text = "---\nname: myskill\ndescription: Does things.\n---\nSkill content.\n"
+        (sk / "SKILL.md").write_text(skill_text)
+        (sk / "scripts" / "asset.txt").write_text("asset bytes")
 
         ctx = make_ctx(self.src, self.dst)
-        m._apply_claude_skills(ctx)
+        m.tier_a_skills_copy(ctx)
 
-        out = (self.dst / "prompts" / "skill-myskill.md").read_text()
-        self.assertIn("Skill content.", out)
-        self.assertIn("1 asset file(s)", out)
+        out = self.dst / "skills" / "myskill"
+        self.assertEqual((out / "SKILL.md").read_text(), skill_text)
+        self.assertEqual((out / "scripts" / "asset.txt").read_text(), "asset bytes")
+        self.assertTrue(any("skills/myskill/" in s for s in ctx.report.migrated_clean))
+
+    def test_codex_system_skills_are_not_migrated(self):
+        # Codex keeps tool-managed skills under skills/.system/ — those
+        # belong to the Codex install, not the user's config.
+        sysdir = self.src / "skills" / ".system" / "builtin"
+        sysdir.mkdir(parents=True)
+        (sysdir / "SKILL.md").write_text("---\nname: builtin\n---\nBuiltin.\n")
+        user = self.src / "skills" / "mine"
+        user.mkdir(parents=True)
+        (user / "SKILL.md").write_text("---\nname: mine\n---\nMine.\n")
+
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_skills_copy(ctx)
+
+        self.assertTrue((self.dst / "skills" / "mine" / "SKILL.md").exists())
+        self.assertFalse((self.dst / "skills" / ".system").exists())
+
+    def test_skill_round_trip_is_byte_identical(self):
+        sk = self.src / "skills" / "rt"
+        sk.mkdir(parents=True)
+        text = "---\nname: rt\nallowed-tools: Bash(git:*)\n---\nBody.\n"
+        (sk / "SKILL.md").write_text(text)
+
+        mid = self.tmp / "mid"
+        mid.mkdir()
+        m.tier_a_skills_copy(make_ctx(self.src, mid))
+        m.tier_a_skills_copy(make_ctx(mid, self.dst))
+
+        self.assertEqual(
+            (self.dst / "skills" / "rt" / "SKILL.md").read_text(), text)
 
 
 # ============================================================================
@@ -761,73 +997,147 @@ class CursorDirectionDriversTests(FsTestBase):
         self.assertEqual(len(mdcs), 1)
 
 
-class TierBCursorFlatteningTests(FsTestBase):
-    """The four cursor-bound Tier B options: claude agents/skills/commands
-    and codex prompts → cursor rules with alwaysApply:false."""
+class CursorNativeTargetsTests(FsTestBase):
+    """Cursor-bound translations against Cursor 2.4+ native runtimes:
+    claude agents → .cursor/agents/*.md subagents (Tier B), and claude
+    commands / codex prompts → slash-invocable Cursor skills (Tier A)."""
 
-    def test_agents_become_alwaysapply_false_rules(self):
+    def test_agents_become_native_cursor_subagents(self):
         agents = self.src / "agents"
         agents.mkdir()
         (agents / "reviewer.md").write_text(
-            "---\ndescription: Code reviewer\n---\nReview carefully.\n")
+            "---\ndescription: Code reviewer\nmodel: claude-opus-4-8\n"
+            "effort: high\ntools: Read, Grep\n---\nReview carefully.\n")
         ctx = make_ctx(self.src, self.dst)
         m._apply_claude_agents_cursor(ctx)
 
-        out = (self.dst / "rules" / "agent-reviewer.mdc").read_text()
+        out = (self.dst / "agents" / "reviewer.md").read_text()
         body, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm.get("name"), "reviewer")
         self.assertEqual(fm.get("description"), "Code reviewer")
-        self.assertEqual(fm.get("alwaysApply"), "false")
+        # effort folds into Cursor's model bracket syntax.
+        self.assertEqual(fm.get("model"), "claude-opus-4-8[effort=high]")
         self.assertIn("Review carefully", body)
+        # tools has no Cursor field — dropped with an in-body note.
+        self.assertIn("`tools`", body)
 
-    def test_skills_flattened_with_asset_note(self):
-        sk = self.src / "skills" / "demo"
-        sk.mkdir(parents=True)
-        (sk / "SKILL.md").write_text(
-            "---\nname: demo\n---\nSkill body.\n")
-        (sk / "asset.txt").write_text("bytes")
-
+    def test_readonly_permission_mode_maps_to_cursor_readonly(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "scout.md").write_text(
+            "---\ndescription: Scout\npermissionMode: plan\n---\nLook around.\n")
         ctx = make_ctx(self.src, self.dst)
-        m._apply_claude_skills_cursor(ctx)
+        m._apply_claude_agents_cursor(ctx)
+        _, fm = m.strip_frontmatter(
+            (self.dst / "agents" / "scout.md").read_text())
+        self.assertEqual(fm.get("readonly"), "true")
 
-        out = (self.dst / "rules" / "skill-demo.mdc").read_text()
-        self.assertIn("alwaysApply: false", out)
-        self.assertIn("1 asset file(s)", out)
-        self.assertIn("Skill body", out)
-        self.assertTrue(any("1 asset" in s
-                            for s in ctx.report.migrated_lossy))
-
-    def test_commands_become_invokable_style_rules(self):
+    def test_commands_become_slash_invocable_cursor_skills(self):
         cmds = self.src / "commands"
         cmds.mkdir()
         (cmds / "foo.md").write_text(
-            "---\ndescription: Do foo\n---\nFoo body.\n")
+            "---\ndescription: Do foo\nargument-hint: [target]\n---\nFoo body.\n")
         ctx = make_ctx(self.src, self.dst)
-        m._apply_claude_commands_cursor(ctx)
+        m.tier_a_commands_to_cursor_skills(ctx, "commands", "commands")
 
-        out = (self.dst / "rules" / "command-foo.mdc").read_text()
+        out = (self.dst / "skills" / "foo" / "SKILL.md").read_text()
         body, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm.get("name"), "foo")
         self.assertEqual(fm.get("description"), "Do foo")
-        self.assertEqual(fm.get("alwaysApply"), "false")
+        self.assertEqual(fm.get("disable-model-invocation"), "true")
         self.assertIn("Foo body", body)
+        # argument-hint survives via the migrator meta comment.
+        self.assertIn("argument-hint", out)
 
-    def test_codex_prompts_become_cursor_rules(self):
+    def test_codex_prompts_become_cursor_skills(self):
         prompts = self.src / "prompts"
         prompts.mkdir()
         (prompts / "summarize.md").write_text("Summarize this.\n")
         ctx = make_ctx(self.src, self.dst)
-        m._apply_codex_prompts_cursor(ctx)
+        m.tier_a_commands_to_cursor_skills(ctx, "prompts", "prompts")
 
-        out = (self.dst / "rules" / "prompt-summarize.mdc").read_text()
-        _, fm = m.strip_frontmatter(out)
-        # No source description → falls back to "Codex prompt: summarize"
+        out = (self.dst / "skills" / "summarize" / "SKILL.md").read_text()
+        body, fm = m.strip_frontmatter(out)
+        # No source description → falls back to the slash-command name.
         self.assertIn("summarize", fm["description"].lower())
-        self.assertEqual(fm["alwaysApply"], "false")
+        self.assertEqual(fm["disable-model-invocation"], "true")
+        self.assertIn("Summarize this.", body)
+
+    def test_cursor_agents_round_trip_to_claude(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "helper.md").write_text(
+            "---\nname: helper\ndescription: Helps out\n"
+            "model: claude-opus-4-8[effort=high]\nis_background: true\n"
+            "readonly: true\n---\nHelp with things.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_cursor_agents_to_claude(ctx)
+
+        out = (self.dst / "agents" / "helper.md").read_text()
+        body, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm.get("name"), "helper")
+        self.assertEqual(fm.get("model"), "claude-opus-4-8")
+        self.assertEqual(fm.get("effort"), "high")
+        self.assertEqual(fm.get("background"), "true")
+        self.assertIn("Help with things.", body)
+        # readonly has no Claude field — kept as a review note.
+        self.assertIn("readonly", body)
+
+
+class CursorHooksTests(FsTestBase):
+    def test_claude_hooks_translate_to_cursor_hooks_json(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{"matcher": "Bash",
+                                "hooks": [{"type": "command",
+                                           "command": "./check.sh",
+                                           "timeout": 30}]}],
+                "Notification": [{"hooks": [{"type": "command",
+                                             "command": "notify-send hi"}]}],
+            },
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_hooks_cursor(ctx)
+
+        data = json.loads((self.dst / "hooks.json").read_text())
+        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["hooks"]["preToolUse"][0]["command"], "./check.sh")
+        self.assertEqual(data["hooks"]["preToolUse"][0]["timeout"], 30)
+        # Notification has no Cursor event — reported, not written.
+        self.assertNotIn("notification", {k.lower() for k in data["hooks"]})
+        self.assertTrue(any("Notification" in s
+                            for s in ctx.report.skipped_unmappable))
+        # The matcher can't be represented — noted.
+        self.assertTrue(any("matcher" in n for n in ctx.report.notes))
+
+    def test_cursor_hooks_translate_to_claude_settings(self):
+        (self.src / "hooks.json").write_text(json.dumps({
+            "version": 1,
+            "hooks": {
+                "stop": [{"command": "./done.sh"}],
+                "beforeShellExecution": [{"command": "./guard.sh"}],
+                "preToolUse": [{"command": "./ask.py", "type": "prompt"}],
+            },
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_cursor_hooks(ctx)
+
+        settings = json.loads((self.dst / "settings.json").read_text())
+        stop = settings["hooks"]["Stop"][0]["hooks"][0]
+        self.assertEqual(stop, {"type": "command", "command": "./done.sh"})
+        # Cursor-only event dropped with a report entry.
+        self.assertTrue(any("beforeShellExecution" in s
+                            for s in ctx.report.skipped_unmappable))
+        # prompt-type hooks aren't translatable.
+        self.assertNotIn("PreToolUse", settings["hooks"])
+        self.assertTrue(any("prompt-type" in n for n in ctx.report.notes))
 
 
 class CursorTierBIntegrationTests(FsTestBase):
     """End-to-end: a claude→cursor run with agents/skills/commands present.
-    Agents/skills/commands should appear under migrated_lossy (when
-    accepted) and not also appear under skipped_unmappable as Tier C."""
+    Agents/commands should appear under migrated_lossy (when accepted),
+    skills under migrated_clean (Tier A), and none of them also under
+    skipped_unmappable as Tier C."""
 
     def test_accepted_tier_b_doesnt_double_count_as_tier_c(self):
         (self.src / "settings.json").write_text("{}")
@@ -840,15 +1150,18 @@ class CursorTierBIntegrationTests(FsTestBase):
         ctx = make_ctx(self.src, self.dst)
         m.run_claude_to_cursor(ctx, lossy_decisions={
             "agents_cursor": True,
-            "skills_cursor": True,
-            "commands_cursor": True,
         })
 
-        # Lossy entries present.
+        # Agents lossy; skills and commands copied cleanly as Tier A.
         joined = " ".join(ctx.report.migrated_lossy)
         self.assertIn("agents/a.md", joined)
-        self.assertIn("skills/sk1/", joined)
-        self.assertIn("commands/c.md", joined)
+        clean = " ".join(ctx.report.migrated_clean)
+        self.assertIn("skills/sk1/", clean)
+        self.assertIn("commands/c.md", clean)
+        self.assertTrue(
+            (self.dst / "skills" / "sk1" / "SKILL.md").exists())
+        self.assertTrue(
+            (self.dst / "skills" / "c" / "SKILL.md").exists())
 
         # And NOT reported as "no equivalent" under unmappable.
         unmappable = " ".join(ctx.report.skipped_unmappable)
@@ -863,7 +1176,7 @@ class CursorTierBIntegrationTests(FsTestBase):
         m.run_claude_to_cursor(ctx, lossy_decisions={"agents_cursor": False})
 
         joined = " ".join(ctx.report.skipped_by_user)
-        self.assertIn("agents/ → .cursor/rules/agent-*.mdc", joined)
+        self.assertIn("agents/ → .cursor/agents/*.md", joined)
         # Still not double-counted as unmappable.
         self.assertNotIn("agents/",
                          " ".join(ctx.report.skipped_unmappable))

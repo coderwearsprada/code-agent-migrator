@@ -11,11 +11,17 @@ Requires Python 3.9+. No third-party dependencies. On 3.11+ it uses the
 stdlib `tomllib`; on 3.9/3.10 it falls back to a small bundled TOML reader
 covering the subset Codex's `config.toml` uses.
 
-**Tested against:** Claude Code `2.1.150`, Codex CLI `0.133.0`, and Cursor
-(MCP `mcp.json` + `.cursor/rules/*.mdc` schemas as of 2026-05). The script
-reads documented config schemas, so minor version bumps should keep working;
-if a future release renames or removes a key, the migrator will flag it as
-"not translated" in the report rather than corrupt your config.
+**Tested against:** Claude Code `2.1.207`, Codex CLI `0.137.0` (schemas
+cross-checked against the 0.144 docs), and Cursor 2.4+/3.x schemas as of
+2026-07. The script reads documented config schemas, so minor version bumps
+should keep working; if a future release renames or removes a key, the
+migrator will flag it as "not translated" in the report rather than corrupt
+your config.
+
+> Codex CLI 0.140+ ships its own interactive `/import` command for pulling
+> Claude Code config in. This migrator remains useful for the other five
+> directions, for scriptable/non-interactive runs, and for the backup +
+> restore safety net.
 
 ## Usage
 
@@ -52,7 +58,7 @@ python3 migrate.py --restore /path/to/backups/pre-migrate-YYYYMMDD-HHMMSS
 | `--merge` / `--overwrite` | Merge into existing destination files where sensible (default), or replace outright. Backups happen either way. |
 | `--no-backup` | Skip the upfront backup (and disable `--restore` for this run). Not recommended. |
 | `--no-interactive` | Don't prompt for Tier B confirmations; combine with `--apply-lossy`/`--skip-lossy`. |
-| `--apply-lossy=IDS` / `--skip-lossy=IDS` | Comma-separated Tier B option IDs (or `all`). IDs: `permissions`, `sandbox`, `hooks`, `notify`, `agents`, `skills`, `profiles`, `agents_cursor`, `skills_cursor`, `commands_cursor`, `prompts_cursor`. |
+| `--apply-lossy=IDS` / `--skip-lossy=IDS` | Comma-separated Tier B option IDs (or `all`). IDs: `permissions`, `sandbox`, `rules`, `hooks`, `codex_hooks`, `notify`, `agents`, `profiles`, `agents_cursor`, `hooks_cursor`, `cursor_hooks`. Unknown IDs (including retired ones) warn and are ignored. |
 
 After each run the script writes `MIGRATION_REPORT.md` at the destination,
 split into: migrated cleanly (Tier A), migrated with loss (Tier B, user-
@@ -62,19 +68,29 @@ confirmed), skipped by user choice, and not translated (no equivalent).
 
 ### Tier A — clean, always applied
 
+**Skills (all six directions)**
+
+All three tools speak the same open [Agent Skills](https://agentskills.io)
+format, so `skills/<name>/` directories copy verbatim — SKILL.md,
+frontmatter, and bundled assets included. Codex's tool-managed
+`skills/.system/` is excluded. (Newer Codex versions also discover the
+vendor-neutral `~/.agents/skills/`; this migrator writes to the tool's own
+`skills/` dir, which all tested versions read.)
+
 **Claude Code ↔ Codex CLI**
 
 | Claude Code                            | Codex CLI                                  |
 |----------------------------------------|--------------------------------------------|
 | `CLAUDE.md`                            | `AGENTS.md`                                |
-| `commands/*.md`                        | `prompts/*.md`                             |
+| `commands/*.md` (`description`, `argument-hint` as native frontmatter) | `prompts/*.md` |
 | `settings.json:model`                  | `config.toml:model`                        |
-| `.mcp.json` / `~/.claude.json`: `mcpServers` (stdio) | `config.toml:[mcp_servers.*]` |
+| `.mcp.json` / `~/.claude.json`: `mcpServers` (stdio + HTTP) | `config.toml:[mcp_servers.*]` |
 | `settings.json:env`                    | `config.toml:[shell_environment_policy] set` |
 | `settings.json:effortLevel`            | `config.toml:model_reasoning_effort`       |
 | `outputStyle` file contents *(c→x only)*  | fenced block inside `AGENTS.md`         |
 | `CLAUDE.md` imports `AGENTS.md` *(project x→c)* | `AGENTS.md`                    |
 | fenced block inside `CLAUDE.md` *(x→c only)* | `config.toml:instructions`           |
+| `agents/*.md` *(x→c: from `.codex/agents/*.toml`)* | `agents/*.toml`               |
 
 **Cursor ↔ Claude / Codex**
 
@@ -82,33 +98,48 @@ confirmed), skipped by user choice, and not translated (no equivalent).
 |----------------------------------------|--------------------------|-----------------------------|
 | `<root>/mcp.json:mcpServers`           | `.mcp.json` / `~/.claude.json`: `mcpServers` | `config.toml:[mcp_servers.*]` |
 | `.cursor/rules/*.mdc` + `.cursorrules` | `.claude/rules/*.md`     | `AGENTS.md`                 |
+| `cli-config.json:model`                | `settings.json:model`    | `config.toml:model`         |
+| `agents/*.md` *(cursor→claude only; Tier B the other way)* | `agents/*.md` | —      |
+| `skills/<name>/SKILL.md` with `disable-model-invocation` *(into cursor)* | ← `commands/*.md` | ← `prompts/*.md` |
 
-Cursor user scope (`~/.cursor`) only has global MCP — Cursor has no
-user-level rules file. Project-scope rules go to/from `<project>/.cursor/`.
-The legacy `.cursorrules` (plain markdown at project root) is read on the
-way out and re-emitted as a single `.cursor/rules/_cursorrules_legacy.mdc`
-on the way in. Cursor rule frontmatter maps to native Claude rule
-frontmatter (`globs` → `paths`), with a small migrator metadata comment for
-Cursor-only fields such as `alwaysApply`.
+Cursor user scope (`~/.cursor`) has global MCP, skills, agents, hooks, and
+the CLI config — Cursor has no user-level rules file. Project-scope rules
+go to/from `<project>/.cursor/`. The legacy `.cursorrules` (plain markdown
+at project root) is read on the way out and re-emitted as a single
+`.cursor/rules/_cursorrules_legacy.mdc` on the way in. Cursor rule
+frontmatter maps to native Claude rule frontmatter (`globs` → `paths`),
+with a small migrator metadata comment for Cursor-only fields such as
+`alwaysApply`.
 
 Notes:
 
-- Slash-command frontmatter `description` and `argument-hint` ride along
-  inside a `<!-- migrator:meta ... -->` comment so they survive a c→x→c
-  round-trip byte-for-byte. Other frontmatter keys (`model`,
-  `allowed-tools`, …) are dropped and logged.
+- Cursor deprecated `.cursor/commands/` in favor of skills, so Claude
+  slash commands and Codex prompts land in Cursor as skills with
+  `disable-model-invocation: true` — still invocable from the `/` menu.
+  `argument-hint` rides along in a `<!-- migrator:meta ... -->` comment.
+- Codex prompts natively support `description` and `argument-hint`
+  frontmatter now, so commands↔prompts round-trip through real
+  frontmatter. Prompts migrated by older versions of this tool (meta
+  comment instead of frontmatter) are still read. Other command
+  frontmatter keys (`model`, `allowed-tools`, …) are dropped and logged.
 - Codex `instructions` (TOML string) and Claude `outputStyle` files
   (markdown) are different shapes for similar things, so they're embedded
   inside the target's instruction document as a `<!-- migrator:begin ... -->`
   fenced block that the reverse direction can unwrap.
-- MCP server transports: **stdio** transfers everywhere. **SSE / HTTP**
-  MCP servers transfer between Claude Code and Cursor (both support them),
-  but are skipped going to Codex (stdio-only) with a report note.
+- MCP server transports: **stdio** transfers everywhere. **Streamable
+  HTTP** (`url` + `headers`) also transfers everywhere — Codex stores it
+  as `url`/`http_headers`. Legacy **SSE** and **WebSocket** servers
+  transfer between Claude Code and Cursor but are skipped going to Codex,
+  with a report note. Codex-only auth fields (`bearer_token_env_var`,
+  `env_http_headers`) don't leave Codex.
 - Effort levels (Claude `effortLevel` ↔ Codex `model_reasoning_effort`)
   share the `low`/`medium`/`high`/`xhigh` vocabulary and map 1:1. Codex's
   extra `minimal` maps to Claude `low`; the legacy Claude `max` alias (the
-  pre-2.1 name for `xhigh`) maps to Codex `xhigh`. Cursor has no equivalent
-  reasoning-effort knob, so this field is reported but not carried.
+  pre-2.1 name for `xhigh`) maps to Codex `xhigh`. Cursor has no global
+  reasoning-effort knob, so this field is reported but not carried (agent
+  files use Cursor's `model[effort=…]` bracket syntax, which does map).
+- At project scope, Cursor reads `AGENTS.md` natively, so codex→cursor
+  leaves it in place and notes that instead of splitting it into rules.
 
 ### Tier B — lossy, user-confirmed
 
@@ -121,40 +152,59 @@ lets you accept or skip per-item (interactively, or via
 
 | Target | ID | Translation | Why lossy |
 |---|---|---|---|
-| Codex  | `permissions`     | `permissions.allow/deny` → `sandbox_mode` + `approval_policy` + `sandbox_workspace_write` | Per-tool regex patterns collapsed into coarse sandbox modes; `Write()` patterns become `writable_roots`; `WebFetch`/`WebSearch` deny becomes `network_access=false`. |
-| Codex  | `hooks`           | `hooks.Notification`/`Stop` → `notify` argv | Only those two hook events have a Codex equivalent. `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`/`PreCompact` are dropped. The shell command is wrapped as `["/bin/sh", "-c", ...]`. |
+| Codex  | `permissions`     | `permissions.allow/deny/ask` → `sandbox_mode` + `approval_policy` + `rules/default.rules` | Overall posture collapses into coarse sandbox modes; `Bash(...)` rules become Starlark `prefix_rule()` entries (exact-match rules widen to prefix matches); `Write()` patterns become `writable_roots`; `WebFetch`/`WebSearch` deny becomes `network_access=false`. |
+| Codex  | `hooks`           | `hooks` → `.codex/hooks.json` + `Notification` → `notify` | Codex hooks share Claude's event names/shape, so command hooks on shared events (PreToolUse, PostToolUse, Stop, …) translate near-verbatim. Non-command hook types (http, mcp_tool, prompt, agent) and Claude-only events (SessionEnd, FileChanged, …) are dropped. |
 | Codex  | `agents`          | `agents/*.md` → `.codex/agents/*.toml` | Claude subagents become Codex custom agents. `name`, `description`, `model`, `effort`, and selected `permissionMode` values map to TOML; skills/tool lists become prompt guidance for review. |
-| Codex  | `skills`          | `skills/*/SKILL.md` → `prompts/skill-*.md` | `SKILL.md` becomes a flat prompt; bundled assets are not migrated and skill auto-discovery is lost. |
-| Cursor | `agents_cursor`   | `agents/*.md` → `.cursor/rules/agent-*.mdc` | Cursor has no subagent runtime. Each agent becomes an `alwaysApply:false` rule — content survives, subagent invocation semantics don't. |
-| Cursor | `skills_cursor`   | `skills/*/SKILL.md` → `.cursor/rules/skill-*.mdc` | Cursor has no skills runtime. `SKILL.md` becomes an `alwaysApply:false` rule; bundled assets are not migrated and auto-discovery is lost. |
-| Cursor | `commands_cursor` | `commands/*.md` → `.cursor/rules/command-*.mdc` | Cursor has no slash-command equivalent. Commands become `alwaysApply:false` rules — loadable, but won't be invokable as `/name`. |
+| Cursor | `agents_cursor`   | `agents/*.md` → `.cursor/agents/*.md` | Cursor 2.4+ runs subagents natively. `name`/`description`/`model` map; `effort` folds into Cursor's `model[effort=…]`; `background` → `is_background`; `permissionMode: readOnly/plan` → `readonly`. Claude-only fields (`tools`, `hooks`, `memory`, `skills`, …) are dropped with in-file notes. |
+| Cursor | `hooks_cursor`    | `hooks` → `.cursor/hooks.json` | Cursor hooks use camelCase events and a flat shape. Command hooks on shared events translate; matchers, non-command hook types, and Claude-only events are dropped. |
 
 #### From Codex CLI (`--from codex`)
 
 | Target | ID | Translation | Why lossy |
 |---|---|---|---|
 | Claude | `sandbox`         | `sandbox_mode`/`approval_policy` → `permissions.allow`/`deny` | Coarse modes expanded into Claude wildcard patterns. Round-trip is semantic, not byte-identical. |
-| Claude | `notify`          | `notify` argv → `hooks.Notification` | Becomes a single-command Claude hook with no matcher. |
-| Claude | `profiles`        | `[profiles.NAME]` → `~/.claude/profiles/NAME.settings.json` | Claude has no profile runtime; each profile is materialized as a standalone settings file you can copy over `settings.json` to activate. |
-| Cursor | `prompts_cursor`  | `prompts/*.md` → `.cursor/rules/prompt-*.mdc` | Cursor has no on-demand prompt invocation. Prompts become `alwaysApply:false` rules — loadable, but lose their on-demand semantics. |
+| Claude | `rules`           | `rules/*.rules` → `permissions` `Bash(...)` patterns | Starlark `prefix_rule()` entries map to `Bash(cmd:*)` allow/ask/deny rules (`allow`→allow, `prompt`→ask, `forbidden`→deny). Prefix semantics are approximated with `:*`; union pattern elements can't be translated. |
+| Claude | `codex_hooks`     | `hooks.json` → `settings.json:hooks` | Command hooks on shared events translate near-verbatim; `commandWindows` variants and non-command hook types are dropped. |
+| Claude | `notify`          | `notify` argv → `hooks.Notification` | Becomes a single-command Claude hook with no matcher (a `/bin/sh -c` wrapper added by a previous claude→codex run is unwrapped). |
+| Claude | `profiles`        | `<name>.config.toml` (and legacy `[profiles.*]`) → `~/.claude/profiles/NAME.settings.json` | Claude has no profile runtime; each profile is materialized as a standalone settings file you can copy over `settings.json` to activate. |
 
 #### From Cursor (`--from cursor`)
 
-_None — cursor→claude and cursor→codex are clean Tier A only._ Rules and
-MCP servers translate verbatim, and rule frontmatter
-(`description`/`globs`/`alwaysApply`) round-trips through native Claude
-rules plus a migrator metadata comment, or through fenced metadata in
-`AGENTS.md` for Codex. The lossy direction is only when going *to* Cursor
-(subagents, skills, slash commands, on-demand prompts) since Cursor has no
-runtime for those source concepts.
+| Target | ID | Translation | Why lossy |
+|---|---|---|---|
+| Claude | `cursor_hooks`    | `hooks.json` → `settings.json:hooks` | Command hooks on shared events translate; Cursor prompt-type hooks and Cursor-only events (`beforeShellExecution`, MCP interception, tab hooks, …) are dropped. |
+
+Everything else cursor→claude and cursor→codex is clean Tier A: rules, MCP
+servers, skills, subagents (to Claude), and the CLI default model translate
+directly, and rule frontmatter (`description`/`globs`/`alwaysApply`)
+round-trips through native Claude rules plus a migrator metadata comment,
+or through fenced metadata in `AGENTS.md` for Codex.
 
 ### Tier C — not translated
 
 Listed in `MIGRATION_REPORT.md` so you know to recreate them by hand:
 
-- **Claude-only:** `statusLine`, `plugins/`, theme, slash-command `model`/`allowed-tools` frontmatter, and the hook event types listed above. When migrating to Cursor, also: `hooks`, `permissions`, `outputStyle` (agents/skills/commands have Tier B options).
-- **Codex-only:** `model_provider(s)`, `tools.web_search`, `disable_response_storage` / history persistence, `tui` settings, `hide_agent_reasoning`, `project_doc_max_bytes`. When migrating to Cursor, also: `approval_policy`, `sandbox_mode`, `sandbox_workspace_write`, `shell_environment_policy`, `profiles`, `model_reasoning_effort`, `notify` (Codex prompts have a Tier B option).
-- **Cursor-only:** Cursor IDE settings (`User/settings.json`), keybindings, extensions list, notepads, composer history — all out of scope (IDE config, not agent config). Cursor MCP entries with `type: "sse"` or HTTP URLs are kept verbatim into Claude, but skipped going to Codex (which only supports stdio).
+- **Claude-only:** `statusLine`, `plugins/`, theme, `fallbackModel`,
+  `availableModels`, `autoMode`, auto-memory settings, sandbox settings,
+  slash-command `model`/`allowed-tools` frontmatter, and hook events with
+  no counterpart on the destination. When migrating to Cursor, also:
+  `permissions` (Cursor's CLI has its own allow/deny rule files —
+  `~/.cursor/cli-config.json` / `.cursor/cli.json` — rebuild by hand),
+  `effortLevel`, `env`, `outputStyle`.
+- **Codex-only:** `model_provider(s)`, `web_search`, `features`,
+  `default_permissions` / named `[permissions.*]` profiles,
+  `disable_response_storage` / history persistence, `tui` settings,
+  `hide_agent_reasoning`, `project_doc_max_bytes`,
+  `project_doc_fallback_filenames`, `[agents]`/`[memories]`/`[apps]`/
+  `[plugins]` tables. When migrating to Cursor, also: `approval_policy`,
+  `sandbox_mode`, `sandbox_workspace_write`, `shell_environment_policy`,
+  `profiles`, `model_reasoning_effort`, `notify`.
+- **Cursor-only:** Cursor IDE settings (`User/settings.json`),
+  keybindings, extensions list, in-app global rules, plugins
+  (`.cursor-plugin/` manifests differ from Claude plugins — reinstall from
+  the marketplace), `permissions.json` MCP/terminal allowlists, and
+  `cli-config.json` keys other than `model` — out of scope (IDE config,
+  not agent config).
 
 ## What is never touched
 
@@ -164,10 +214,12 @@ The script ignores state, secrets, and caches on the source side, including:
   `file-history/`, `cache/`, `paste-cache/`, `shell-snapshots/`,
   `telemetry/`, `mcp-needs-auth-cache.json`
 - **Codex:** `auth.json`, `history.jsonl`, `sessions/`, `log/`,
-  `version.json`
+  `version.json`, `*.sqlite*` state (memories, goals, logs),
+  `skills/.system/` (tool-managed system skills)
 - **Cursor:** the OS-specific user settings dir (`User/settings.json`,
   keybindings, extensions, workspace storage) — anywhere outside
-  `<root>/mcp.json` and `<root>/rules/*.mdc`
+  `<root>/mcp.json`, `<root>/rules/*.mdc`, `<root>/skills/`,
+  `<root>/agents/`, `<root>/hooks.json`, and `cli-config.json:model`
 
 ## How a migration runs
 
@@ -203,13 +255,18 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-70 tests, stdlib-only. They cover the TOML writer, frontmatter and
-fenced-block round-trips, MCP normalization for all three tools, every
-Tier A direction (claude↔codex, claude↔cursor, codex↔cursor), the
-slash-command `description`/`argument-hint` round-trip, MDC frontmatter
-+ legacy `.cursorrules` parsing, every Tier B heuristic, the plan-mode
+89 tests, stdlib-only. They cover the TOML writer, frontmatter and
+fenced-block round-trips, MCP normalization for all three tools (stdio +
+streamable HTTP), every Tier A direction (claude↔codex, claude↔cursor,
+codex↔cursor), skills tree copies (including the byte-identical round-trip
+and the Codex system-skills exclusion), the slash-command
+`description`/`argument-hint` round-trip, prefix-rule emission/parsing and
+its round-trip, hooks translation to Codex and Cursor, MDC frontmatter +
+legacy `.cursorrules` parsing, every Tier B heuristic, the plan-mode
 contract, the backup-then-restore round-trip, and a full
 cursor→claude→cursor metadata round-trip. Verified on Python 3.9 and 3.13.
+The generated Codex prefix rules were additionally validated against the
+real `codex execpolicy check` tool.
 
 ## License
 
