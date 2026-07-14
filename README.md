@@ -2,18 +2,19 @@
 
 A single-file Python script that migrates settings and custom configuration
 between [Claude Code](https://claude.com/claude-code) (`~/.claude`),
-[Codex CLI](https://github.com/openai/codex) (`~/.codex`), and
-[Cursor](https://cursor.com) (`~/.cursor`), in any pairwise direction —
-with an upfront backup of every file it will touch and a `--restore`
-command to undo a run.
+[Codex CLI](https://github.com/openai/codex) (`~/.codex`),
+[Cursor](https://cursor.com) (`~/.cursor`), and
+[opencode](https://opencode.ai) (`~/.config/opencode`), in any pairwise
+direction — with an upfront backup of every file it will touch and a
+`--restore` command to undo a run.
 
 Requires Python 3.9+. No third-party dependencies. On 3.11+ it uses the
 stdlib `tomllib`; on 3.9/3.10 it falls back to a small bundled TOML reader
 covering the subset Codex's `config.toml` uses.
 
 **Tested against:** Claude Code `2.1.207`, Codex CLI `0.137.0` (schemas
-cross-checked against the 0.144 docs), and Cursor 2.4+/3.x schemas as of
-2026-07. The script reads documented config schemas, so minor version bumps
+cross-checked against the 0.144 docs), Cursor 2.4+/3.x schemas, and
+opencode 1.x schemas (config.json schema + docs), all as of 2026-07. The script reads documented config schemas, so minor version bumps
 should keep working; if a future release renames or removes a key, the
 migrator will flag it as "not translated" in the report rather than corrupt
 your config.
@@ -26,10 +27,12 @@ your config.
 ## Usage
 
 ```bash
-# Any pairwise direction between {claude, codex, cursor}.
+# Any pairwise direction between {claude, codex, cursor, opencode}.
 python3 migrate.py --from claude --to codex
 python3 migrate.py --from cursor --to claude
 python3 migrate.py --from codex  --to cursor
+python3 migrate.py --from claude --to opencode
+python3 migrate.py --from opencode --to codex
 
 # Project-level instead of user-level (also accepts --scope both)
 python3 migrate.py --from claude --to cursor --scope project
@@ -50,15 +53,15 @@ python3 migrate.py --restore /path/to/backups/pre-migrate-YYYYMMDD-HHMMSS
 
 | Flag | Meaning |
 |---|---|
-| `--from {claude,codex,cursor}` / `--to {claude,codex,cursor}` | Source and destination tools. Required unless `--restore` is given. |
+| `--from {claude,codex,cursor,opencode}` / `--to {claude,codex,cursor,opencode}` | Source and destination tools. Required unless `--restore` is given. |
 | `--restore [BACKUP_DIR]` | Reverse a previous migration. Omit to use the latest backup found under any tool's backups dir. |
 | `--scope {user,project,both}` | Which config scope(s) to migrate (default: `user`). |
-| `--claude-dir PATH` / `--codex-dir PATH` / `--cursor-dir PATH` | Explicit config dirs; overrides `--scope`. |
+| `--claude-dir PATH` / `--codex-dir PATH` / `--cursor-dir PATH` / `--opencode-dir PATH` | Explicit config dirs; overrides `--scope`. |
 | `--dry-run` | Print the plan and report, write nothing. |
 | `--merge` / `--overwrite` | Merge into existing destination files where sensible (default), or replace outright. Backups happen either way. |
 | `--no-backup` | Skip the upfront backup (and disable `--restore` for this run). Not recommended. |
 | `--no-interactive` | Don't prompt for Tier B confirmations; combine with `--apply-lossy`/`--skip-lossy`. |
-| `--apply-lossy=IDS` / `--skip-lossy=IDS` | Comma-separated Tier B option IDs (or `all`). IDs: `permissions`, `sandbox`, `rules`, `hooks`, `codex_hooks`, `notify`, `agents`, `profiles`, `agents_cursor`, `hooks_cursor`, `cursor_hooks`. Unknown IDs (including retired ones) warn and are ignored. |
+| `--apply-lossy=IDS` / `--skip-lossy=IDS` | Comma-separated Tier B option IDs (or `all`). IDs: `permissions`, `sandbox`, `rules`, `hooks`, `codex_hooks`, `notify`, `agents`, `profiles`, `agents_cursor`, `hooks_cursor`, `cursor_hooks`, `permissions_opencode`, `opencode_permissions`, `rules_opencode`, `opencode_rules`, `agents_opencode`. Unknown IDs (including retired ones) warn and are ignored. |
 
 After each run the script writes `MIGRATION_REPORT.md` at the destination,
 split into: migrated cleanly (Tier A), migrated with loss (Tier B, user-
@@ -68,14 +71,16 @@ confirmed), skipped by user choice, and not translated (no equivalent).
 
 ### Tier A — clean, always applied
 
-**Skills (all six directions)**
+**Skills (every direction)**
 
-All three tools speak the same open [Agent Skills](https://agentskills.io)
+All supported tools speak the same open [Agent Skills](https://agentskills.io)
 format, so `skills/<name>/` directories copy verbatim — SKILL.md,
 frontmatter, and bundled assets included. Codex's tool-managed
-`skills/.system/` is excluded. (Newer Codex versions also discover the
-vendor-neutral `~/.agents/skills/`; this migrator writes to the tool's own
-`skills/` dir, which all tested versions read.)
+`skills/.system/` is excluded, and opencode's legacy singular `skill/` dir
+is read (the plural is written). (Newer Codex versions also discover the
+vendor-neutral `~/.agents/skills/`, and opencode reads `.claude/skills`
+natively; this migrator writes to each tool's own `skills/` dir, which all
+tested versions read.)
 
 **Claude Code ↔ Codex CLI**
 
@@ -110,6 +115,21 @@ at project root) is read on the way out and re-emitted as a single
 frontmatter maps to native Claude rule frontmatter (`globs` → `paths`),
 with a small migrator metadata comment for Cursor-only fields such as
 `alwaysApply`.
+
+**opencode ↔ Claude / Codex / Cursor**
+
+| opencode                               | Maps to |
+|----------------------------------------|---------|
+| `AGENTS.md` (global or project)        | `CLAUDE.md` / `AGENTS.md` / cursor rules. opencode reads project `AGENTS.md` and even `CLAUDE.md` natively, so same-file cases become a report note instead of a copy. |
+| `opencode.json:model` (`provider/model`) | `settings.json:model` / `config.toml:model` / `cli-config.json:model` — the provider prefix is added from the source tool (`anthropic/`, `openai/`) or stripped on the way out, with a note when the provider doesn't match the destination. |
+| `opencode.json:mcp` (`local` argv / `remote` url) | `mcpServers` (stdio/http) / `[mcp_servers.*]` |
+| `commands/*.md` (`description`)        | Claude `commands/`, Codex `prompts/`, Cursor slash-invocable skills. `argument-hint` rides in a migrator:meta comment; opencode's `agent`/`model`/`subtask` keys are dropped with notes. |
+| `agents/*.md` (`description`, `mode`, `model`) | Claude/Cursor subagent markdown or Codex agent TOML — Tier A out of opencode; claude→opencode is Tier B (`agents_opencode`) since Claude's `tools`/`hooks`/`memory` fields don't carry. |
+
+opencode's config is read from `opencode.json`/`opencode.jsonc` (comments
+and trailing commas handled); the migrator always writes plain
+`opencode.json`. Singular legacy dirs (`agent/`, `command/`, `skill/`) are
+read; plural canonical dirs are written.
 
 Notes:
 
@@ -157,6 +177,8 @@ lets you accept or skip per-item (interactively, or via
 | Codex  | `agents`          | `agents/*.md` → `.codex/agents/*.toml` | Claude subagents become Codex custom agents. `name`, `description`, `model`, `effort`, and selected `permissionMode` values map to TOML; skills/tool lists become prompt guidance for review. |
 | Cursor | `agents_cursor`   | `agents/*.md` → `.cursor/agents/*.md` | Cursor 2.4+ runs subagents natively. `name`/`description`/`model` map; `effort` folds into Cursor's `model[effort=…]`; `background` → `is_background`; `permissionMode: readOnly/plan` → `readonly`. Claude-only fields (`tools`, `hooks`, `memory`, `skills`, …) are dropped with in-file notes. |
 | Cursor | `hooks_cursor`    | `hooks` → `.cursor/hooks.json` | Cursor hooks use camelCase events and a flat shape. Command hooks on shared events translate; matchers, non-command hook types, and Claude-only events are dropped. |
+| opencode | `permissions_opencode` | `permissions` → `opencode.json:permission` | Claude `Bash(cmd:*)` prefix rules become opencode glob patterns (`"cmd*"`); `Write`/`Read`/`WebFetch` wildcards become tool-level actions. The intent carries, but opencode is last-match-wins where Claude is most-specific-wins. |
+| opencode | `agents_opencode` | `agents/*.md` → opencode `agents/*.md` | opencode runs subagents natively (`mode: subagent`). `name`/`description`/`model` map (provider-qualified); `readOnly`/`plan` permission modes become `permission: edit/bash deny`; Claude-only fields are dropped with in-file notes. |
 
 #### From Codex CLI (`--from codex`)
 
@@ -167,12 +189,20 @@ lets you accept or skip per-item (interactively, or via
 | Claude | `codex_hooks`     | `hooks.json` → `settings.json:hooks` | Command hooks on shared events translate near-verbatim; `commandWindows` variants and non-command hook types are dropped. |
 | Claude | `notify`          | `notify` argv → `hooks.Notification` | Becomes a single-command Claude hook with no matcher (a `/bin/sh -c` wrapper added by a previous claude→codex run is unwrapped). |
 | Claude | `profiles`        | `<name>.config.toml` (and legacy `[profiles.*]`) → `~/.claude/profiles/NAME.settings.json` | Claude has no profile runtime; each profile is materialized as a standalone settings file you can copy over `settings.json` to activate. |
+| opencode | `rules_opencode` | `rules/*.rules` → `opencode.json:permission.bash` | Codex prefix rules become opencode glob patterns (`allow`→allow, `prompt`→ask, `forbidden`→deny). Union pattern elements can't be translated. |
 
 #### From Cursor (`--from cursor`)
 
 | Target | ID | Translation | Why lossy |
 |---|---|---|---|
 | Claude | `cursor_hooks`    | `hooks.json` → `settings.json:hooks` | Command hooks on shared events translate; Cursor prompt-type hooks and Cursor-only events (`beforeShellExecution`, MCP interception, tab hooks, …) are dropped. |
+
+#### From opencode (`--from opencode`)
+
+| Target | ID | Translation | Why lossy |
+|---|---|---|---|
+| Claude | `opencode_permissions` | `permission` → `settings.json:permissions` | opencode glob patterns become Claude prefix rules; mid-pattern wildcards and per-path `edit` maps can't be translated. |
+| Codex  | `opencode_rules`  | `permission.bash` → `rules/default.rules` | opencode bash glob patterns become Codex `prefix_rule()` entries; mid-pattern wildcards can't be expressed as prefixes. |
 
 Everything else cursor→claude and cursor→codex is clean Tier A: rules, MCP
 servers, skills, subagents (to Claude), and the CLI default model translate
@@ -205,6 +235,11 @@ Listed in `MIGRATION_REPORT.md` so you know to recreate them by hand:
   the marketplace), `permissions.json` MCP/terminal allowlists, and
   `cli-config.json` keys other than `model` — out of scope (IDE config,
   not agent config).
+- **opencode-only:** `provider` blocks, `small_model`, `plugin` (plugins
+  are TypeScript code, not translatable config — the reason Claude hooks
+  also can't land in opencode), `formatter`, `lsp`, `theme`/`keybinds`
+  (tui.json), `share`, `autoupdate`, `snapshot`, `compaction`,
+  `instructions` file references (noted so you can copy the files).
 
 ## What is never touched
 
@@ -220,6 +255,9 @@ The script ignores state, secrets, and caches on the source side, including:
   keybindings, extensions, workspace storage) — anywhere outside
   `<root>/mcp.json`, `<root>/rules/*.mdc`, `<root>/skills/`,
   `<root>/agents/`, `<root>/hooks.json`, and `cli-config.json:model`
+- **opencode:** `~/.local/share/opencode/` (auth.json, mcp-auth.json,
+  session storage, logs) and `~/.cache/opencode/` — everything outside
+  `opencode.json[c]`, `AGENTS.md`, and the agents/commands/skills dirs
 
 ## How a migration runs
 
@@ -255,18 +293,20 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-89 tests, stdlib-only. They cover the TOML writer, frontmatter and
-fenced-block round-trips, MCP normalization for all three tools (stdio +
-streamable HTTP), every Tier A direction (claude↔codex, claude↔cursor,
-codex↔cursor), skills tree copies (including the byte-identical round-trip
-and the Codex system-skills exclusion), the slash-command
-`description`/`argument-hint` round-trip, prefix-rule emission/parsing and
-its round-trip, hooks translation to Codex and Cursor, MDC frontmatter +
-legacy `.cursorrules` parsing, every Tier B heuristic, the plan-mode
-contract, the backup-then-restore round-trip, and a full
-cursor→claude→cursor metadata round-trip. Verified on Python 3.9 and 3.13.
-The generated Codex prefix rules were additionally validated against the
-real `codex execpolicy check` tool.
+108 tests, stdlib-only. They cover the TOML writer, JSONC stripping,
+frontmatter and fenced-block round-trips, MCP normalization for all four
+tools (stdio + streamable HTTP + opencode local/remote), every Tier A
+direction, skills tree copies (including the byte-identical round-trip and
+the Codex system-skills exclusion), the slash-command
+`description`/`argument-hint` round-trips (including through opencode),
+prefix-rule emission/parsing and its round-trips (Claude and opencode),
+permission-map translation both ways, agent round-trips through opencode,
+hooks translation to Codex and Cursor, MDC frontmatter + legacy
+`.cursorrules` parsing, every Tier B heuristic, the plan-mode contract,
+the backup-then-restore round-trip, and a full cursor→claude→cursor
+metadata round-trip. Verified on Python 3.9 and 3.13. The generated Codex
+prefix rules were additionally validated against the real
+`codex execpolicy check` tool.
 
 ## License
 

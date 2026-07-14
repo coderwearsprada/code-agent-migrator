@@ -1182,6 +1182,273 @@ class CursorTierBIntegrationTests(FsTestBase):
                          " ".join(ctx.report.skipped_unmappable))
 
 
+class JsoncTests(unittest.TestCase):
+    def test_comments_and_trailing_commas_stripped(self):
+        text = ('{\n  // line comment\n  "a": 1, /* block */\n'
+                '  "url": "https://x/y", // not a comment inside string\n'
+                '  "b": [1, 2,],\n}\n')
+        data = json.loads(m._strip_jsonc(text))
+        self.assertEqual(data, {"a": 1, "url": "https://x/y", "b": [1, 2]})
+
+
+class OpencodeMcpTests(FsTestBase):
+    def test_local_and_remote_round_trip(self):
+        rep = m.Report(direction="t")
+        native_local = {"type": "stdio", "command": "srv", "args": ["-v"],
+                        "env": {"K": "v"}}
+        oc = m._mcp_native_to_opencode("x", native_local, rep)
+        self.assertEqual(oc, {"type": "local", "command": ["srv", "-v"],
+                              "environment": {"K": "v"}})
+        self.assertEqual(m._mcp_opencode_to_native(oc), native_local)
+
+        native_remote = {"type": "http", "url": "https://r.test",
+                         "headers": {"X": "y"}}
+        oc = m._mcp_native_to_opencode("r", native_remote, rep)
+        self.assertEqual(oc, {"type": "remote", "url": "https://r.test",
+                              "headers": {"X": "y"}})
+        self.assertEqual(m._mcp_opencode_to_native(oc), native_remote)
+
+    def test_ws_skipped_sse_noted(self):
+        rep = m.Report(direction="t")
+        self.assertIsNone(m._mcp_native_to_opencode(
+            "w", {"type": "ws", "url": "wss://w"}, rep))
+        self.assertEqual(len(rep.skipped_unmappable), 1)
+        out = m._mcp_native_to_opencode(
+            "s", {"type": "sse", "url": "https://s"}, rep)
+        self.assertEqual(out["type"], "remote")
+        self.assertTrue(any("SSE" in n for n in rep.notes))
+
+
+class OpencodeModelTests(unittest.TestCase):
+    def test_prefixing_by_source_tool(self):
+        self.assertEqual(m.model_to_opencode("claude-opus-4-8", "claude"),
+                         "anthropic/claude-opus-4-8")
+        self.assertEqual(m.model_to_opencode("gpt-5.6", "codex"),
+                         "openai/gpt-5.6")
+        # Already qualified or unknown provider → pass through.
+        self.assertEqual(m.model_to_opencode("groq/llama", "claude"),
+                         "groq/llama")
+        self.assertEqual(m.model_to_opencode("mystery", "cursor"), "mystery")
+
+    def test_stripping(self):
+        self.assertEqual(m.model_from_opencode("anthropic/claude-x"),
+                         ("claude-x", "anthropic"))
+        self.assertEqual(m.model_from_opencode("bare"), ("bare", None))
+
+
+class OpencodePermissionTests(FsTestBase):
+    def test_claude_rules_become_glob_map(self):
+        rep = m.Report(direction="t")
+        mapped = m._claude_perms_to_opencode({
+            "allow": ["Bash(git commit:*)", "Read(*)"],
+            "ask": ["Bash(git push:*)"],
+            "deny": ["Bash(rm -rf:*)", "WebFetch(*)"],
+        }, rep)
+        self.assertEqual(mapped["bash"]["git commit*"], "allow")
+        self.assertEqual(mapped["bash"]["git push*"], "ask")
+        self.assertEqual(mapped["bash"]["rm -rf*"], "deny")
+        self.assertEqual(mapped["read"], "allow")
+        self.assertEqual(mapped["webfetch"], "deny")
+
+    def test_opencode_map_becomes_claude_rules(self):
+        rep = m.Report(direction="t")
+        mapped = m._opencode_perms_to_claude({
+            "bash": {"git *": "allow", "*": "ask", "rm *": "deny"},
+            "edit": "allow",
+        }, rep)
+        self.assertIn("Bash(git:*)", mapped["allow"])
+        self.assertIn("Write(*)", mapped["allow"])
+        self.assertIn("Bash(*)", mapped["ask"])
+        self.assertIn("Bash(rm:*)", mapped["deny"])
+
+    def test_round_trip_preserves_bash_intent(self):
+        rep = m.Report(direction="t")
+        oc = m._claude_perms_to_opencode(
+            {"allow": ["Bash(npm run build:*)"]}, rep)
+        back = m._opencode_perms_to_claude(oc, rep)
+        self.assertIn("Bash(npm run build:*)", back["allow"])
+
+    def test_opencode_bash_map_becomes_codex_prefix_rules(self):
+        (self.src / "opencode.json").write_text(json.dumps({
+            "permission": {"bash": {"git push*": "ask", "docker*": "deny",
+                                    "mid*fix": "allow"}}
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_opencode_bash_rules(ctx)
+        rules = (self.dst / "rules" / "default.rules").read_text()
+        self.assertIn(
+            'prefix_rule(pattern=["git", "push"], decision="prompt")', rules)
+        self.assertIn('prefix_rule(pattern=["docker"], decision="forbidden")',
+                      rules)
+        # Mid-pattern wildcards can't be prefixes — noted, not emitted.
+        self.assertNotIn("mid", rules)
+        self.assertTrue(any("mid*fix" in n for n in ctx.report.notes))
+
+
+class OpencodeConfigIoTests(FsTestBase):
+    def test_jsonc_config_read_and_json_written(self):
+        (self.src / "opencode.jsonc").write_text(
+            '{\n  // c\n  "model": "anthropic/claude-x",\n'
+            '  "theme": "dark",\n}\n')
+        cfg = m.load_opencode_config(self.src)
+        self.assertEqual(cfg["model"], "anthropic/claude-x")
+
+        ctx = make_ctx(self.src, self.dst)
+        m.opencode_update_config(ctx, {"model": "anthropic/claude-y"})
+        out = json.loads((self.dst / "opencode.json").read_text())
+        self.assertEqual(out["model"], "anthropic/claude-y")
+
+    def test_project_scope_reads_and_writes_project_root_config(self):
+        oc_root = self.tmp / "proj" / ".opencode"
+        oc_root.mkdir(parents=True)
+        (oc_root.parent / "opencode.json").write_text(
+            json.dumps({"model": "anthropic/claude-x"}))
+        self.assertEqual(
+            m.load_opencode_config(oc_root)["model"], "anthropic/claude-x")
+        self.assertEqual(m.opencode_config_write_path(oc_root),
+                         oc_root.parent / "opencode.json")
+
+    def test_nested_dict_updates_merge(self):
+        (self.dst / "opencode.json").write_text(json.dumps(
+            {"mcp": {"keep": {"type": "remote", "url": "https://k"}}}))
+        ctx = make_ctx(self.src, self.dst)
+        m.opencode_update_config(
+            ctx, {"mcp": {"new": {"type": "remote", "url": "https://n"}}})
+        out = json.loads((self.dst / "opencode.json").read_text())
+        self.assertIn("keep", out["mcp"])
+        self.assertIn("new", out["mcp"])
+
+
+class OpencodeAgentsTests(FsTestBase):
+    def test_claude_agent_round_trips_through_opencode(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "rev.md").write_text(
+            "---\ndescription: Reviewer\nmodel: claude-opus-4-8\n"
+            "permissionMode: plan\n---\nReview things.\n")
+        mid = self.tmp / "mid"
+        mid.mkdir()
+        ctx = make_ctx(self.src, mid)
+        m._agents_write_opencode(ctx, m._agents_read_claude(self.src), "claude")
+
+        out = (mid / "agents" / "rev.md").read_text()
+        body, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm.get("description"), "Reviewer")
+        self.assertEqual(fm.get("mode"), "subagent")
+        self.assertEqual(fm.get("model"), "anthropic/claude-opus-4-8")
+        # plan permission mode became a permission deny block.
+        self.assertIn("edit: deny", out)
+        self.assertIn("Review things.", body)
+
+        ctx_back = make_ctx(mid, self.dst)
+        m._agents_write_claude(ctx_back, m._agents_read_opencode(mid))
+        back = (self.dst / "agents" / "rev.md").read_text()
+        _, fm_back = m.strip_frontmatter(back)
+        self.assertEqual(fm_back.get("description"), "Reviewer")
+        self.assertEqual(fm_back.get("model"), "claude-opus-4-8")
+
+    def test_opencode_agent_to_codex_toml(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "h.md").write_text(
+            "---\ndescription: Helper\nmode: subagent\n"
+            "model: openai/gpt-5.6\n---\nHelp.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m._agents_write_codex(ctx, m._agents_read_opencode(self.src))
+        cfg = tomllib.loads((self.dst / "agents" / "h.toml").read_text())
+        self.assertEqual(cfg["name"], "h")
+        self.assertEqual(cfg["model"], "gpt-5.6")
+        self.assertIn("Help.", cfg["developer_instructions"])
+
+    def test_legacy_singular_agent_dir_read(self):
+        legacy = self.src / "agent"
+        legacy.mkdir()
+        (legacy / "old.md").write_text("---\ndescription: Old\n---\nOld body.\n")
+        specs = m._agents_read_opencode(self.src)
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].description, "Old")
+
+
+class OpencodeCommandsTests(FsTestBase):
+    def test_claude_command_round_trips_through_opencode(self):
+        cmds = self.src / "commands"
+        cmds.mkdir()
+        (cmds / "ship.md").write_text(
+            "---\ndescription: Ship it\nargument-hint: [env]\n---\nShip $1.\n")
+        mid = self.tmp / "mid"
+        mid.mkdir()
+        m.tier_a_commands_to_opencode(make_ctx(self.src, mid), "commands")
+
+        out = (mid / "commands" / "ship.md").read_text()
+        _, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm, {"description": "Ship it"})
+        self.assertIn("argument-hint", out)  # rides in the meta comment
+
+        m.tier_a_opencode_commands_to(make_ctx(mid, self.dst), "commands")
+        back = (self.dst / "commands" / "ship.md").read_text()
+        body, fm_back = m.strip_frontmatter(back)
+        self.assertEqual(fm_back.get("description"), "Ship it")
+        self.assertEqual(fm_back.get("argument-hint"), "[env]")
+        self.assertIn("Ship $1.", body)
+
+    def test_opencode_only_keys_dropped_with_note(self):
+        cmds = self.src / "commands"
+        cmds.mkdir()
+        (cmds / "sum.md").write_text(
+            "---\ndescription: Sum\nagent: build\nsubtask: true\n---\nGo.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_opencode_commands_to(ctx, "prompts")
+        _, fm = m.strip_frontmatter((self.dst / "prompts" / "sum.md").read_text())
+        self.assertEqual(fm, {"description": "Sum"})
+        self.assertTrue(any("agent" in n and "subtask" in n
+                            for n in ctx.report.notes))
+
+
+class OpencodeRunnerTests(FsTestBase):
+    def test_claude_to_opencode_end_to_end(self):
+        (self.src / "CLAUDE.md").write_text("Project instructions.\n")
+        (self.src / "settings.json").write_text(json.dumps({
+            "model": "claude-opus-4-8",
+            "hooks": {"Stop": [{"hooks": [{"type": "command",
+                                           "command": "x"}]}]},
+            "mcpServers": {"loc": {"command": "srv"}},
+        }))
+        sk = self.src / "skills" / "s1"
+        sk.mkdir(parents=True)
+        (sk / "SKILL.md").write_text("---\nname: s1\ndescription: d\n---\nb\n")
+
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_opencode(ctx, lossy_decisions={})
+
+        cfg = json.loads((self.dst / "opencode.json").read_text())
+        self.assertEqual(cfg["model"], "anthropic/claude-opus-4-8")
+        self.assertEqual(cfg["mcp"]["loc"]["command"], ["srv"])
+        self.assertTrue((self.dst / "AGENTS.md").exists())
+        self.assertTrue((self.dst / "skills" / "s1" / "SKILL.md").exists())
+        # Hooks can't exist in opencode — reported, not silently dropped.
+        self.assertTrue(any("hooks" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_opencode_to_claude_end_to_end(self):
+        (self.src / "AGENTS.md").write_text("OC instructions.\n")
+        (self.src / "opencode.json").write_text(json.dumps({
+            "model": "anthropic/claude-sonnet-4-5",
+            "mcp": {"rem": {"type": "remote", "url": "https://r.test"}},
+            "theme": "dark",
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_opencode_to_claude(ctx, lossy_decisions={})
+
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(settings["model"], "claude-sonnet-4-5")
+        self.assertTrue((self.dst / "CLAUDE.md").exists())
+        mcp = json.loads((self.dst / "mcp.json").read_text())["mcpServers"]
+        self.assertEqual(mcp["rem"]["type"], "http")
+        # theme is opencode-only.
+        self.assertTrue(any("theme" in s
+                            for s in ctx.report.skipped_unmappable))
+
+
 class FindLatestBackupTests(FsTestBase):
     """find_latest_backup must consider every tool's backups dir, ordered
     by the manifest's created_at, so consecutive migrations across

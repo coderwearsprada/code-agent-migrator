@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 migrate.py — Migrate settings + custom configuration between Claude Code
-(~/.claude), Codex CLI (~/.codex), and Cursor (~/.cursor), in any pairwise
-direction.
+(~/.claude), Codex CLI (~/.codex), Cursor (~/.cursor), and opencode
+(~/.config/opencode), in any pairwise direction.
 
 Requires Python 3.9+. No third-party dependencies.
 
@@ -826,11 +826,11 @@ def tier_a_prompts_to_commands(ctx: Ctx) -> None:
         ctx.report.migrated_clean.append(f"prompts/{rel} → commands/{rel}")
 
 
-def _skill_dirs(root: Path) -> list[Path]:
-    """Skill dirs under <root>/skills — one dir per skill, identified by a
-    SKILL.md inside. Hidden dirs are skipped: Codex keeps system-managed
+def _skill_dirs(root: Path, subdir: str = "skills") -> list[Path]:
+    """Skill dirs under <root>/<subdir> — one dir per skill, identified by
+    a SKILL.md inside. Hidden dirs are skipped: Codex keeps system-managed
     skills under `skills/.system/`, which belong to the tool, not the user."""
-    skills_root = root / "skills"
+    skills_root = root / subdir
     if not skills_root.is_dir():
         return []
     out: list[Path] = []
@@ -840,19 +840,21 @@ def _skill_dirs(root: Path) -> list[Path]:
     return out
 
 
-def tier_a_skills_copy(ctx: Ctx) -> None:
-    """skills/<name>/ → skills/<name>/ — Claude Code, Codex CLI, and Cursor
-    all speak the same Agent Skills format (SKILL.md + bundled assets), so
-    skills transfer as a verbatim tree copy in every direction."""
-    for skill_dir in _skill_dirs(ctx.src_root):
-        dst_dir = ctx.dst_root / "skills" / skill_dir.name
+def tier_a_skills_copy(ctx: Ctx, src_subdir: str = "skills",
+                       dst_subdir: str = "skills") -> None:
+    """skills/<name>/ → skills/<name>/ — every supported tool speaks the
+    same Agent Skills format (SKILL.md + bundled assets), so skills
+    transfer as a verbatim tree copy in every direction. Only the
+    directory name varies per tool (e.g. opencode uses `skill/`)."""
+    for skill_dir in _skill_dirs(ctx.src_root, src_subdir):
+        dst_dir = ctx.dst_root / dst_subdir / skill_dir.name
         n_files = 0
         for f in sorted(skill_dir.rglob("*")):
             if f.is_file():
                 copy_file(ctx, f, dst_dir / f.relative_to(skill_dir))
                 n_files += 1
         ctx.report.migrated_clean.append(
-            f"skills/{skill_dir.name}/ → skills/{skill_dir.name}/ "
+            f"{src_subdir}/{skill_dir.name}/ → {dst_subdir}/{skill_dir.name}/ "
             f"({n_files} file(s), incl. assets)")
 
 
@@ -1461,6 +1463,872 @@ def _native_mcp_from_codex(name: str, spec: dict) -> dict:
             out[k] = list(spec[k]) if k == "args" else (
                 dict(spec[k]) if k == "env" else spec[k])
     return out
+
+
+# ============================================================================
+# opencode — I/O helpers
+# ============================================================================
+# opencode (opencode.ai) keeps its global config under ~/.config/opencode
+# (XDG layout, not a home dot-dir): opencode.json[c] + AGENTS.md +
+# agents/ + commands/ + skills/ (plural canonical; singular legacy names
+# are still read). Project scope is <project>/opencode.json plus a
+# .opencode/ dir with the same subdirs. Models are provider-qualified
+# ("anthropic/claude-…"), MCP servers live under the "mcp" config key as
+# local (argv array) / remote (url) entries, and permissions are
+# tool→pattern-map objects that line up well with Claude's Bash() rules.
+# opencode reads CLAUDE.md and .claude/skills natively, so some
+# claude→opencode moves are no-ops that we surface as notes.
+
+OPENCODE_PROVIDER_FOR_TOOL = {"claude": "anthropic", "codex": "openai"}
+
+OPENCODE_UNMAPPABLE_KEYS = (
+    "provider", "plugin", "formatter", "lsp", "share", "autoupdate",
+    "snapshot", "compaction", "keybinds", "theme", "tools", "watcher",
+    "disabled_providers", "enabled_providers", "experimental", "server",
+)
+
+
+def _strip_jsonc(text: str) -> str:
+    """Strip // and /* */ comments plus trailing commas from JSONC,
+    respecting string literals. opencode accepts .jsonc config files."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    # Trailing commas: `,` immediately before `}` or `]`.
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def _opencode_project_root(root: Path) -> Path | None:
+    return root.parent if root.name == ".opencode" else None
+
+
+def opencode_config_paths(root: Path) -> list[Path]:
+    """Candidate config files for this scope, lowest→highest precedence."""
+    candidates: list[Path] = []
+    project = _opencode_project_root(root)
+    for base in filter(None, [project, root]):
+        candidates += [base / "opencode.jsonc", base / "opencode.json"]
+    return candidates
+
+
+def opencode_config_write_path(root: Path) -> Path:
+    """Canonical config file to write: <project>/opencode.json at project
+    scope, <root>/opencode.json otherwise."""
+    project = _opencode_project_root(root)
+    return (project or root) / "opencode.json"
+
+
+def load_opencode_config(root: Path) -> dict:
+    merged: dict = {}
+    for p in opencode_config_paths(root):
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(_strip_jsonc(p.read_text(encoding="utf-8")))
+        except json.JSONDecodeError as e:
+            print(f"warn: {p} not valid JSON(C) ({e}); skipping",
+                  file=sys.stderr)
+            continue
+        if isinstance(data, dict):
+            merged.update(data)
+    return merged
+
+
+def opencode_update_config(ctx: Ctx, updates: dict) -> None:
+    """Merge `updates` into the destination opencode.json (one level of
+    nested-dict merging, enough for `mcp` / `permission`)."""
+    dst = opencode_config_write_path(ctx.dst_root)
+    existing: dict = {}
+    if ctx.merge:
+        if dst.exists():
+            try:
+                existing = json.loads(
+                    _strip_jsonc(dst.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                existing = {}
+        else:
+            existing = load_opencode_config(ctx.dst_root)
+    for k, v in updates.items():
+        if isinstance(v, dict) and isinstance(existing.get(k), dict):
+            existing[k].update(v)
+        else:
+            existing[k] = v
+    write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+
+
+def _opencode_subdirs(root: Path, plural: str) -> list[Path]:
+    """Existing content dirs for a category, plural first, singular legacy
+    second (both are read by opencode; we only ever write the plural)."""
+    return [d for d in (root / plural, root / plural.rstrip("s"))
+            if d.is_dir()]
+
+
+def model_to_opencode(model: str, src_tool: str) -> str:
+    """opencode model ids are provider-qualified. Bare ids from tools with
+    a known provider get prefixed; anything already qualified passes."""
+    if "/" in model:
+        return model
+    provider = OPENCODE_PROVIDER_FOR_TOOL.get(src_tool)
+    return f"{provider}/{model}" if provider else model
+
+
+def model_from_opencode(model: str) -> tuple[str, str | None]:
+    if "/" in model:
+        provider, _, model_id = model.partition("/")
+        return model_id, provider
+    return model, None
+
+
+def _mcp_opencode_to_native(spec: dict) -> dict | None:
+    """opencode MCP entry → Claude/Cursor-shaped spec."""
+    t = str(spec.get("type") or ("local" if spec.get("command") else "remote"))
+    if t == "local":
+        cmd = spec.get("command")
+        if isinstance(cmd, str):
+            cmd = [cmd]
+        if not cmd:
+            return None
+        out: dict = {"type": "stdio", "command": cmd[0]}
+        if list(cmd[1:]):
+            out["args"] = list(cmd[1:])
+        if spec.get("environment"):
+            out["env"] = dict(spec["environment"])
+        return out
+    if t == "remote" and spec.get("url"):
+        out = {"type": "http", "url": spec["url"]}
+        if spec.get("headers"):
+            out["headers"] = dict(spec["headers"])
+        return out
+    return None
+
+
+def _mcp_native_to_opencode(name: str, spec: dict, report: Report) -> dict | None:
+    """Claude/Cursor-shaped spec → opencode MCP entry (argv array,
+    `environment`, local/remote discriminator)."""
+    t = _mcp_transport(spec)
+    if t == "stdio":
+        if not spec.get("command"):
+            report.skipped_unmappable.append(f"MCP server '{name}' has no command")
+            return None
+        out: dict = {"type": "local",
+                     "command": [spec["command"], *list(spec.get("args") or [])]}
+        if spec.get("env"):
+            out["environment"] = dict(spec["env"])
+        return out
+    if t in ("http", "sse"):
+        if not spec.get("url"):
+            report.skipped_unmappable.append(f"MCP server '{name}' has no url")
+            return None
+        out = {"type": "remote", "url": spec["url"]}
+        if spec.get("headers"):
+            out["headers"] = dict(spec["headers"])
+        if t == "sse":
+            report.notes.append(
+                f"MCP server '{name}': legacy SSE transport mapped to an "
+                "opencode remote server — verify it still connects")
+        return out
+    report.skipped_unmappable.append(
+        f"MCP server '{name}' uses type='{t}' (opencode supports local "
+        "stdio and remote url servers)")
+    return None
+
+
+def opencode_read_mcp(root: Path) -> dict:
+    """Read opencode MCP servers as Claude-shaped specs."""
+    out: dict = {}
+    for name, spec in (load_opencode_config(root).get("mcp") or {}).items():
+        if isinstance(spec, dict):
+            native = _mcp_opencode_to_native(spec)
+            if native:
+                out[name] = native
+    return out
+
+
+def opencode_write_mcp(ctx: Ctx, servers: dict) -> None:
+    """Write Claude-shaped MCP specs into opencode.json:mcp."""
+    entries: dict = {}
+    for name, spec in servers.items():
+        t = _mcp_native_to_opencode(name, spec, ctx.report)
+        if t is not None:
+            entries[name] = t
+            ctx.report.migrated_clean.append(
+                f"MCP server '{name}' → opencode.json:mcp.{name}")
+    if entries:
+        opencode_update_config(ctx, {"mcp": entries})
+
+
+def opencode_read_commands(root: Path) -> list[tuple[Path, dict, str]]:
+    items: list[tuple[Path, dict, str]] = []
+    for d in _opencode_subdirs(root, "commands"):
+        for f in sorted(d.rglob("*.md")):
+            body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+            items.append((f.relative_to(d), fm or {}, body))
+    return items
+
+
+def opencode_docs_note_or_copy(ctx: Ctx, src_doc: Path) -> None:
+    """Instruction doc → opencode. opencode reads AGENTS.md natively (and
+    falls back to CLAUDE.md), so at project scope an existing AGENTS.md
+    needs no work; otherwise write <dst>/AGENTS.md."""
+    project = _opencode_project_root(ctx.dst_root)
+    dst = (project / "AGENTS.md") if project else (ctx.dst_root / "AGENTS.md")
+    if not src_doc.exists():
+        return
+    if src_doc == dst:
+        ctx.report.notes.append(
+            "AGENTS.md at the project root is read natively by opencode — "
+            "no translation needed")
+        return
+    body = src_doc.read_text(encoding="utf-8").rstrip() + "\n"
+    if dst.exists() and ctx.merge:
+        existing = dst.read_text(encoding="utf-8").rstrip()
+        body = existing + "\n\n" + body if existing else body
+    write_text(ctx, dst, body)
+    ctx.report.migrated_clean.append(f"{src_doc.name} → {dst.name}")
+
+
+# ---- opencode ↔ claude permission maps -------------------------------------
+# opencode `permission` is a tool→action or tool→{pattern: action} map with
+# glob patterns ("git push*") and last-match-wins. Claude Bash() rules use
+# prefix patterns ("Bash(git push:*)"). The translation is close but the
+# matching semantics differ, hence Tier B.
+
+def _claude_perms_to_opencode(perms: dict, report: Report) -> dict:
+    out: dict = {}
+    bash: dict = {}
+    for key in ("allow", "ask", "deny"):
+        for rule in perms.get(key) or []:
+            rule = str(rule)
+            tokens = _claude_bash_rule_to_tokens(rule)
+            if tokens:
+                bash[f"{shlex.join(tokens)}*"] = key
+                continue
+            if re.fullmatch(r"Bash(\(\*?\))?", rule):
+                bash["*"] = key
+            elif rule.startswith(("Write(", "Edit(")):
+                out.setdefault("edit", key)
+            elif rule.startswith(("WebFetch", "WebSearch")):
+                out.setdefault("webfetch", key)
+            elif rule.startswith("Read("):
+                out.setdefault("read", key)
+            else:
+                report.notes.append(
+                    f"permissions: {rule} has no opencode permission "
+                    "equivalent")
+    if bash:
+        out["bash"] = bash
+    return out
+
+
+def _opencode_perms_to_claude(permission: dict, report: Report) -> dict:
+    """opencode permission map → Claude permissions.allow/ask/deny lists."""
+    out: dict[str, list[str]] = {"allow": [], "ask": [], "deny": []}
+
+    def add(action: object, rule: str) -> None:
+        if action in out:
+            out[str(action)].append(rule)
+
+    tool_rules = {"edit": "Write", "read": "Read", "webfetch": "WebFetch"}
+    for tool, val in permission.items():
+        if tool == "bash":
+            if isinstance(val, str):
+                add(val, "Bash(*)")
+                continue
+            for pattern, action in (val or {}).items():
+                if pattern in ("*", ""):
+                    add(action, "Bash(*)")
+                    continue
+                base = pattern.rstrip("*").strip()
+                if "*" in base:
+                    report.notes.append(
+                        f"permission.bash: pattern {pattern!r} has "
+                        "mid-pattern wildcards — not translated")
+                    continue
+                add(action, f"Bash({base}:*)")
+        elif tool in tool_rules:
+            action = val if isinstance(val, str) else None
+            if action:
+                add(action, f"{tool_rules[tool]}(*)")
+            else:
+                report.notes.append(
+                    f"permission.{tool}: per-path pattern map not "
+                    "translated — recreate path rules by hand")
+        else:
+            report.notes.append(
+                f"permission.{tool} has no Claude permissions equivalent")
+    return {k: sorted(set(v)) for k, v in out.items() if v}
+
+
+# ============================================================================
+# AgentSpec — shared subagent intermediate for the newer tool pairs
+# ============================================================================
+# claude↔codex and claude↔cursor agent translation predates this and stays
+# as-is; every pair involving opencode (and future tools) goes through this
+# normalized record so each tool needs one reader + one writer instead of
+# a converter per pair.
+
+@dataclass
+class AgentSpec:
+    name: str
+    description: str
+    body: str
+    model: str | None = None      # bare model id (no provider prefix)
+    provider: str | None = None   # provider hint when the source knows it
+    effort: str | None = None
+    background: bool = False
+    readonly: bool = False
+    dropped: list[str] = field(default_factory=list)  # untranslatable keys
+
+
+def _spec_notes_section(spec: AgentSpec) -> str:
+    if not spec.dropped:
+        return ""
+    return ("\n\n## Manual migration notes\n\n- Source agent fields with no "
+            "equivalent here were dropped: "
+            + ", ".join(f"`{d}`" for d in sorted(set(spec.dropped))) + ".\n")
+
+
+def _agents_read_opencode(root: Path) -> list[AgentSpec]:
+    specs: list[AgentSpec] = []
+    carried = {"description", "mode", "model", "name"}
+    for d in _opencode_subdirs(root, "agents"):
+        for f in sorted(d.rglob("*.md")):
+            body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+            fm = fm or {}
+            model_id, provider = (None, None)
+            if fm.get("model"):
+                model_id, provider = model_from_opencode(fm["model"])
+            # Our frontmatter parser is flat; a nested `permission:` block
+            # surfaces as stray keys — report them as dropped rather than
+            # mis-translating.
+            dropped = sorted(k for k in fm if k not in carried)
+            specs.append(AgentSpec(
+                name=safe_agent_name(fm.get("name") or f.stem),
+                description=fm.get("description")
+                or f"Imported from opencode agent {f.stem}.",
+                body=body.strip(),
+                model=model_id, provider=provider,
+                dropped=dropped,
+            ))
+    return specs
+
+
+def _agents_write_opencode(ctx: Ctx, specs: list[AgentSpec],
+                           src_tool: str) -> None:
+    dst_dir = ctx.dst_root / "agents"
+    provider_default = OPENCODE_PROVIDER_FOR_TOOL.get(src_tool)
+    for spec in specs:
+        lines = ["---", f"description: {spec.description}", "mode: subagent"]
+        if spec.model:
+            provider = spec.provider or provider_default
+            if provider:
+                lines.append(f"model: {provider}/{spec.model}")
+            else:
+                lines.append(f"model: {spec.model}")
+                ctx.report.notes.append(
+                    f"agent {spec.name}: opencode model ids are "
+                    f"provider-qualified — check `{spec.model}` resolves")
+        if spec.readonly:
+            lines += ["permission:", "  edit: deny", "  bash: deny"]
+        lines.append("---\n")
+        dropped = list(spec.dropped)
+        if spec.effort:
+            dropped.append("effort (opencode has no reasoning-effort knob)")
+        if spec.background:
+            dropped.append("background")
+        body = spec.body + _spec_notes_section(
+            AgentSpec(spec.name, spec.description, "", dropped=dropped))
+        write_text(ctx, dst_dir / f"{spec.name}.md",
+                   "\n".join(lines) + body.rstrip() + "\n")
+        label = f"agent {spec.name} → agents/{spec.name}.md (opencode subagent)"
+        if dropped:
+            ctx.report.migrated_lossy.append(
+                f"{label} (dropped: {', '.join(sorted(set(dropped)))})")
+        else:
+            ctx.report.migrated_clean.append(label)
+
+
+def _agents_read_claude(root: Path) -> list[AgentSpec]:
+    src_dir = root / "agents"
+    specs: list[AgentSpec] = []
+    if not src_dir.is_dir():
+        return specs
+    carried = {"name", "description", "model", "effort", "background",
+               "permissionMode"}
+    for f in sorted(src_dir.rglob("*.md")):
+        if f.stem == "README":
+            continue
+        body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+        fm = fm or {}
+        specs.append(AgentSpec(
+            name=safe_agent_name(fm.get("name") or f.stem),
+            description=fm.get("description")
+            or f"Migrated Claude subagent {f.stem}.",
+            body=body.strip(),
+            model=fm.get("model"), provider=None,
+            effort=fm.get("effort"),
+            background=str(fm.get("background", "")).lower() == "true",
+            readonly=fm.get("permissionMode") in ("readOnly", "plan"),
+            dropped=sorted(k for k in fm if k not in carried),
+        ))
+    return specs
+
+
+def _agents_read_codex(root: Path) -> list[AgentSpec]:
+    src_dir = root / "agents"
+    specs: list[AgentSpec] = []
+    if not src_dir.is_dir():
+        return specs
+    carried = {"name", "description", "developer_instructions",
+               "instructions", "model", "model_reasoning_effort",
+               "sandbox_mode"}
+    for f in sorted(src_dir.glob("*.toml")):
+        cfg = load_toml(f)
+        body = str(cfg.get("developer_instructions")
+                   or cfg.get("instructions") or "").strip()
+        if not body:
+            continue
+        specs.append(AgentSpec(
+            name=safe_agent_name(cfg.get("name") or f.stem),
+            description=str(cfg.get("description")
+                            or f"Imported from Codex agent {f.stem}."),
+            body=body,
+            model=cfg.get("model"), provider="openai",
+            effort=_codex_effort_to_claude(cfg.get("model_reasoning_effort")),
+            readonly=cfg.get("sandbox_mode") == "read-only",
+            dropped=sorted(k for k in cfg if k not in carried),
+        ))
+    return specs
+
+
+def _agents_read_cursor(root: Path) -> list[AgentSpec]:
+    src_dir = root / "agents"
+    specs: list[AgentSpec] = []
+    if not src_dir.is_dir():
+        return specs
+    carried = {"name", "description", "model", "readonly", "is_background"}
+    for f in sorted(src_dir.rglob("*.md")):
+        if f.stem == "README":
+            continue
+        body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+        fm = fm or {}
+        model_id, effort = (None, None)
+        if fm.get("model") and fm["model"] != "inherit":
+            model_id, effort = _parse_cursor_model(fm["model"])
+        specs.append(AgentSpec(
+            name=safe_agent_name(fm.get("name") or f.stem),
+            description=fm.get("description")
+            or f"Imported from Cursor subagent {f.stem}.",
+            body=body.strip(),
+            model=model_id, effort=effort,
+            background=str(fm.get("is_background", "")).lower() == "true",
+            readonly=str(fm.get("readonly", "")).lower() == "true",
+            dropped=sorted(k for k in fm if k not in carried),
+        ))
+    return specs
+
+
+def _agents_write_claude(ctx: Ctx, specs: list[AgentSpec]) -> None:
+    dst_dir = ctx.dst_root / "agents"
+    for spec in specs:
+        fm: dict[str, str] = {"name": spec.name,
+                              "description": spec.description}
+        if spec.model:
+            fm["model"] = spec.model
+            if spec.provider and spec.provider != "anthropic":
+                ctx.report.notes.append(
+                    f"agent {spec.name}: model `{spec.model}` came from "
+                    f"provider {spec.provider!r} — verify Claude Code can "
+                    "run it")
+        if spec.effort:
+            fm["effort"] = _codex_effort_to_claude(spec.effort) or spec.effort
+        if spec.background:
+            fm["background"] = "true"
+        dropped = list(spec.dropped)
+        if spec.readonly:
+            dropped.append("readonly (restrict `tools` by hand if needed)")
+        body = spec.body + _spec_notes_section(
+            AgentSpec(spec.name, spec.description, "", dropped=dropped))
+        write_text(ctx, dst_dir / f"{spec.name}.md",
+                   make_frontmatter(fm) + body.rstrip() + "\n")
+        ctx.report.migrated_clean.append(
+            f"agent {spec.name} → agents/{spec.name}.md")
+
+
+def _agents_write_codex(ctx: Ctx, specs: list[AgentSpec]) -> None:
+    dst_dir = ctx.dst_root / "agents"
+    for spec in specs:
+        agent: dict[str, object] = {
+            "name": spec.name,
+            "description": spec.description,
+            "developer_instructions":
+                spec.body + _spec_notes_section(spec),
+        }
+        if spec.model:
+            agent["model"] = spec.model
+            if spec.provider and spec.provider != "openai":
+                ctx.report.notes.append(
+                    f"agent {spec.name}: model `{spec.model}` came from "
+                    f"provider {spec.provider!r} — verify Codex can run it")
+        if spec.effort:
+            agent["model_reasoning_effort"] = EFFORT_C2X.get(
+                spec.effort, spec.effort)
+        if spec.readonly:
+            agent["sandbox_mode"] = "read-only"
+        write_text(ctx, dst_dir / f"{spec.name}.toml", render_toml(agent))
+        ctx.report.migrated_clean.append(
+            f"agent {spec.name} → agents/{spec.name}.toml (Codex custom agent)")
+
+
+def _agents_write_cursor(ctx: Ctx, specs: list[AgentSpec]) -> None:
+    dst_dir = ctx.dst_root / "agents"
+    for spec in specs:
+        fm: dict[str, str] = {"name": spec.name,
+                              "description": spec.description}
+        if spec.model and spec.effort:
+            fm["model"] = f"{spec.model}[effort={spec.effort}]"
+        elif spec.model:
+            fm["model"] = spec.model
+        if spec.background:
+            fm["is_background"] = "true"
+        if spec.readonly:
+            fm["readonly"] = "true"
+        body = spec.body + _spec_notes_section(spec)
+        write_text(ctx, dst_dir / f"{spec.name}.md",
+                   make_frontmatter(fm) + body.rstrip() + "\n")
+        ctx.report.migrated_clean.append(
+            f"agent {spec.name} → agents/{spec.name}.md (Cursor subagent)")
+
+
+AGENT_READERS: dict[str, Callable[[Path], list[AgentSpec]]] = {
+    "claude": _agents_read_claude,
+    "codex": _agents_read_codex,
+    "cursor": _agents_read_cursor,
+    "opencode": _agents_read_opencode,
+}
+
+
+# ---- opencode commands ↔ claude/codex slash commands ------------------------
+
+def tier_a_commands_to_opencode(ctx: Ctx, src_subdir: str) -> None:
+    """Claude commands / Codex prompts → opencode commands/*.md.
+
+    `description` is shared; `argument-hint` has no opencode key and rides
+    in a migrator:meta comment ($ARGUMENTS/$1 substitution works the same
+    on both sides). Other frontmatter keys are dropped with a note."""
+    src_dir = ctx.src_root / src_subdir
+    if not src_dir.is_dir():
+        return
+    dst_dir = ctx.dst_root / "commands"
+    for f in sorted(src_dir.rglob("*.md")):
+        rel = f.relative_to(src_dir)
+        text = f.read_text(encoding="utf-8")
+        body, fm = strip_frontmatter(text)
+        if fm is None:
+            body, fm = meta_comment_to_frontmatter(text)
+        fm = fm or {}
+        out_fm = {k: v for k, v in fm.items() if k == "description"}
+        meta = frontmatter_to_meta_comment(
+            {k: v for k, v in fm.items() if k == "argument-hint"})
+        dropped = sorted(fm.keys() - {"description", "argument-hint"})
+        if dropped:
+            ctx.report.notes.append(
+                f"{src_subdir}/{rel}: dropped frontmatter keys: "
+                f"{', '.join(dropped)}")
+        out = (make_frontmatter(out_fm) if out_fm else "") + meta + body
+        write_text(ctx, dst_dir / rel, out)
+        ctx.report.migrated_clean.append(
+            f"{src_subdir}/{rel} → commands/{rel}")
+
+
+def tier_a_opencode_commands_to(ctx: Ctx, dst_subdir: str) -> None:
+    """opencode commands → Claude commands/ or Codex prompts/.
+
+    `description` is shared. opencode's `agent`/`model`/`subtask` keys
+    have no equivalent slash-command field and are dropped with notes
+    (model ids are provider-qualified and wouldn't resolve anyway)."""
+    for d in _opencode_subdirs(ctx.src_root, "commands"):
+        for f in sorted(d.rglob("*.md")):
+            rel = f.relative_to(d)
+            body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+            # A meta comment may follow the frontmatter (that's how
+            # argument-hint survives the trip into opencode) — merge both.
+            body, meta = meta_comment_to_frontmatter(body)
+            fm = {**(meta or {}), **(fm or {})}
+            out_fm = {k: v for k, v in fm.items()
+                      if k in ("description", "argument-hint")}
+            dropped = sorted(fm.keys() - {"description", "argument-hint"})
+            if dropped:
+                ctx.report.notes.append(
+                    f"commands/{rel}: dropped frontmatter keys: "
+                    f"{', '.join(dropped)}")
+            out = (make_frontmatter(out_fm) if out_fm else "") + body
+            write_text(ctx, ctx.dst_root / dst_subdir / rel, out)
+            ctx.report.migrated_clean.append(
+                f"commands/{rel} → {dst_subdir}/{rel}")
+
+
+def _skills_copy_from_opencode(ctx: Ctx) -> None:
+    """Skills out of opencode: the plural canonical dir plus the singular
+    legacy dir (opencode reads both; we write only the plural)."""
+    tier_a_skills_copy(ctx)
+    tier_a_skills_copy(ctx, src_subdir="skill")
+
+
+def _opencode_report_unmappables(ctx: Ctx, cfg: dict) -> None:
+    for k in OPENCODE_UNMAPPABLE_KEYS:
+        if k in cfg:
+            ctx.report.skipped_unmappable.append(
+                f"opencode.json:{k} (no equivalent — recreate by hand)")
+    if cfg.get("instructions"):
+        ctx.report.notes.append(
+            "opencode.json:instructions references extra instruction files "
+            "— copy those files over manually if still relevant")
+    if cfg.get("small_model"):
+        ctx.report.skipped_unmappable.append(
+            "opencode.json:small_model (no equivalent)")
+
+
+# ---- opencode direction runners ---------------------------------------------
+
+def run_claude_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    tier_a_docs_claude_to_codex(ctx)  # CLAUDE.md (+rules/outputStyle) → AGENTS.md
+    ctx.report.notes.append(
+        "opencode also reads CLAUDE.md and .claude/skills natively — the "
+        "copies above make the config self-contained")
+    tier_a_commands_to_opencode(ctx, "commands")
+    tier_a_skills_copy(ctx)
+
+    settings = load_claude_settings(ctx.src_root)
+    updates: dict = {}
+    if isinstance(settings.get("model"), str):
+        updates["model"] = model_to_opencode(settings["model"], "claude")
+        ctx.report.migrated_clean.append(
+            f"settings.json:model → opencode.json:model={updates['model']}")
+    if updates:
+        opencode_update_config(ctx, updates)
+    mcp = claude_read_mcp(ctx)
+    if mcp:
+        opencode_write_mcp(ctx, mcp)
+    for key in ("effortLevel", "env", "statusLine", "outputStyle"):
+        if settings.get(key):
+            ctx.report.skipped_unmappable.append(
+                f"settings.json:{key} (no opencode equivalent)")
+    if settings.get("hooks"):
+        ctx.report.skipped_unmappable.append(
+            "settings.json:hooks (opencode plugins are TypeScript code, "
+            "not configurable hooks — port by hand)")
+
+    _run_lossy(ctx, lossy_decisions, "claude->opencode")
+
+
+def run_opencode_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    tier_a_docs_codex_to_claude(ctx)  # AGENTS.md → CLAUDE.md (@import at project)
+    tier_a_opencode_commands_to(ctx, "commands")
+    _skills_copy_from_opencode(ctx)
+    _agents_write_claude(ctx, _agents_read_opencode(ctx.src_root))
+
+    cfg = load_opencode_config(ctx.src_root)
+    dst = ctx.dst_root / "settings.json"
+    existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+    if isinstance(cfg.get("model"), str):
+        model_id, provider = model_from_opencode(cfg["model"])
+        existing["model"] = model_id
+        ctx.report.migrated_clean.append(
+            f"opencode.json:model → settings.json:model={model_id}")
+        if provider and provider != "anthropic":
+            ctx.report.notes.append(
+                f"model came from provider {provider!r} — verify Claude "
+                "Code can run it")
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+    mcp = opencode_read_mcp(ctx.src_root)
+    if mcp:
+        claude_write_mcp(ctx, mcp)
+        for name in mcp:
+            ctx.report.migrated_clean.append(
+                f"opencode.json:mcp.{name} → "
+                f"{claude_mcp_path(ctx).name}:mcpServers.{name}")
+    _opencode_report_unmappables(ctx, cfg)
+
+    _run_lossy(ctx, lossy_decisions, "opencode->claude")
+
+
+def run_codex_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = (ctx.src_doc if ctx.src_doc and ctx.src_doc.exists()
+               else ctx.src_root / "AGENTS.md")
+    opencode_docs_note_or_copy(ctx, src_doc)
+    tier_a_commands_to_opencode(ctx, "prompts")
+    tier_a_skills_copy(ctx)
+    _agents_write_opencode(ctx, _agents_read_codex(ctx.src_root), "codex")
+
+    cfg = load_toml(ctx.src_root / "config.toml")
+    if isinstance(cfg.get("model"), str):
+        opencode_update_config(
+            ctx, {"model": model_to_opencode(cfg["model"], "codex")})
+        ctx.report.migrated_clean.append(
+            "config.toml:model → opencode.json:model")
+    mcp = cfg.get("mcp_servers") or {}
+    if mcp:
+        opencode_write_mcp(
+            ctx, {n: _native_mcp_from_codex(n, s) for n, s in mcp.items()})
+    for k in ("model_reasoning_effort", "notify", "shell_environment_policy",
+              "sandbox_mode", "approval_policy", "profiles"):
+        if k in cfg:
+            ctx.report.skipped_unmappable.append(
+                f"config.toml:{k} (no opencode equivalent)")
+
+    _run_lossy(ctx, lossy_decisions, "codex->opencode")
+
+
+def run_opencode_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = ctx.src_root / "AGENTS.md"
+    project = _opencode_project_root(ctx.src_root)
+    if project and (project / "AGENTS.md").exists():
+        src_doc = project / "AGENTS.md"
+    dst_doc = ctx.dst_doc or (ctx.dst_root / "AGENTS.md")
+    if src_doc.exists():
+        if src_doc == dst_doc:
+            ctx.report.notes.append(
+                "AGENTS.md at the project root is read natively by both "
+                "tools — no translation needed")
+        else:
+            body = src_doc.read_text(encoding="utf-8").rstrip() + "\n"
+            if dst_doc.exists() and ctx.merge:
+                existing = dst_doc.read_text(encoding="utf-8").rstrip()
+                body = existing + "\n\n" + body if existing else body
+            write_text(ctx, dst_doc, body)
+            ctx.report.migrated_clean.append(f"AGENTS.md → {dst_doc.name}")
+    tier_a_opencode_commands_to(ctx, "prompts")
+    _skills_copy_from_opencode(ctx)
+    _agents_write_codex(ctx, _agents_read_opencode(ctx.src_root))
+
+    cfg = load_opencode_config(ctx.src_root)
+    if isinstance(cfg.get("model"), str):
+        model_id, provider = model_from_opencode(cfg["model"])
+        dst = ctx.dst_root / "config.toml"
+        existing = load_toml(dst) if (ctx.merge and dst.exists()) else {}
+        existing["model"] = model_id
+        write_text(ctx, dst, render_toml(existing))
+        ctx.report.migrated_clean.append(
+            f"opencode.json:model → config.toml:model={model_id}")
+        if provider and provider != "openai":
+            ctx.report.notes.append(
+                f"model came from provider {provider!r} — verify Codex can "
+                "run it")
+    mcp = opencode_read_mcp(ctx.src_root)
+    if mcp:
+        dst = ctx.dst_root / "config.toml"
+        existing = load_toml(dst) if (ctx.merge and dst.exists()) else {}
+        existing.setdefault("mcp_servers", {})
+        for name, spec in mcp.items():
+            t = _normalize_mcp_claude_to_codex(name, spec, ctx.report)
+            if t is not None:
+                existing["mcp_servers"][name] = t
+                ctx.report.migrated_clean.append(
+                    f"opencode.json:mcp.{name} → [mcp_servers.{name}]")
+        write_text(ctx, dst, render_toml(existing))
+    _opencode_report_unmappables(ctx, cfg)
+
+    _run_lossy(ctx, lossy_decisions, "opencode->codex")
+
+
+def run_cursor_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    rules = cursor_read_rules(ctx.src_root)
+    if rules:
+        doc = cursor_rules_to_doc(rules)
+        project = _opencode_project_root(ctx.dst_root)
+        dst_doc = (project / "AGENTS.md") if project else (
+            ctx.dst_root / "AGENTS.md")
+        if dst_doc.exists() and ctx.merge:
+            doc = dst_doc.read_text(encoding="utf-8").rstrip() + "\n\n" + doc
+        write_text(ctx, dst_doc, doc + "\n")
+        ctx.report.migrated_clean.append(
+            f"{len(rules)} cursor rule(s) → {dst_doc.name}")
+    tier_a_skills_copy(ctx)
+    _agents_write_opencode(ctx, _agents_read_cursor(ctx.src_root), "cursor")
+
+    mcp = cursor_read_mcp(ctx.src_root)
+    if mcp:
+        opencode_write_mcp(
+            ctx, {n: _normalize_mcp_for_cursor(s) for n, s in mcp.items()})
+    model = cursor_cli_config_read_model(ctx.src_root)
+    if model:
+        opencode_update_config(
+            ctx, {"model": model_to_opencode(model, "cursor")})
+        ctx.report.migrated_clean.append(
+            "cli-config.json:model → opencode.json:model")
+        if "/" not in model:
+            ctx.report.notes.append(
+                f"opencode model ids are provider-qualified — check "
+                f"`{model}` resolves")
+
+    _run_lossy(ctx, lossy_decisions, "cursor->opencode")
+
+
+def run_opencode_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = ctx.src_root / "AGENTS.md"
+    project_src = _opencode_project_root(ctx.src_root)
+    if project_src and (project_src / "AGENTS.md").exists():
+        src_doc = project_src / "AGENTS.md"
+    project_dst = cursor_project_root_from(ctx.dst_root)
+    if (project_dst and src_doc.exists()
+            and src_doc == project_dst / "AGENTS.md"):
+        ctx.report.notes.append(
+            "AGENTS.md at the project root is read natively by Cursor — "
+            "no translation needed")
+    elif src_doc.exists():
+        rules = doc_to_cursor_rules(src_doc.read_text(encoding="utf-8"))
+        if rules:
+            cursor_write_rules(rules, ctx.dst_root, ctx)
+            ctx.report.migrated_clean.append(
+                f"AGENTS.md → {len(rules)} cursor rule file(s)")
+    _skills_copy_from_opencode(ctx)
+    for subdir in ("commands", "command"):
+        tier_a_commands_to_cursor_skills(ctx, subdir, "commands")
+    _agents_write_cursor(ctx, _agents_read_opencode(ctx.src_root))
+
+    cfg = load_opencode_config(ctx.src_root)
+    mcp = opencode_read_mcp(ctx.src_root)
+    if mcp:
+        out = {n: _normalize_mcp_for_cursor(s) for n, s in mcp.items()}
+        cursor_write_mcp(out, ctx.dst_root, ctx)
+        ctx.report.migrated_clean.append(_cursor_label_mcp("→ cursor mcp.json", out))
+    if isinstance(cfg.get("model"), str):
+        model_id, _ = model_from_opencode(cfg["model"])
+        cursor_cli_config_write_model(ctx, model_id)
+        ctx.report.migrated_clean.append(
+            f"opencode.json:model → cli-config.json:model={model_id}")
+    _opencode_report_unmappables(ctx, cfg)
+
+    _run_lossy(ctx, lossy_decisions, "opencode->cursor")
 
 
 # ---- claude → cursor -------------------------------------------------------
@@ -2530,6 +3398,159 @@ def _apply_cursor_hooks(ctx: Ctx) -> None:
             "prompt-type hooks and Cursor-only events dropped)")
 
 
+# ---- B8: opencode permissions ↔ claude permissions / codex rules -----------
+# opencode's `permission` map and Claude's `permissions` lists carry the
+# same intent with different pattern semantics (glob last-match-wins vs
+# prefix specificity), and Codex prefix rules bridge through the same
+# Claude-shaped intermediate. All four directions are Tier B.
+
+def _detect_claude_permissions_opencode(ctx: Ctx) -> bool:
+    return bool(load_claude_settings(ctx.src_root).get("permissions"))
+
+
+def _preview_claude_permissions_opencode(ctx: Ctx) -> str:
+    perms = load_claude_settings(ctx.src_root).get("permissions") or {}
+    n = sum(len(perms.get(k) or []) for k in ("allow", "ask", "deny"))
+    return (f"{n} permission rule(s) → opencode.json:permission "
+            "(glob patterns, last-match-wins)")
+
+
+def _apply_claude_permissions_opencode(ctx: Ctx) -> None:
+    perms = load_claude_settings(ctx.src_root).get("permissions") or {}
+    mapped = _claude_perms_to_opencode(perms, ctx.report)
+    if not mapped:
+        return
+    opencode_update_config(ctx, {"permission": mapped})
+    ctx.report.migrated_lossy.append(
+        "permissions → opencode.json:permission "
+        "(prefix rules approximated as globs; matching semantics differ)")
+
+
+def _detect_opencode_permissions(ctx: Ctx) -> bool:
+    return bool(load_opencode_config(ctx.src_root).get("permission"))
+
+
+def _preview_opencode_permissions(ctx: Ctx) -> str:
+    permission = load_opencode_config(ctx.src_root).get("permission") or {}
+    keys = (", ".join(sorted(permission))
+            if isinstance(permission, dict) else str(permission))
+    return f"permission ({keys}) → settings.json:permissions"
+
+
+def _apply_opencode_permissions(ctx: Ctx) -> None:
+    permission = load_opencode_config(ctx.src_root).get("permission")
+    if isinstance(permission, str):
+        permission = {"bash": permission, "edit": permission}
+    if not isinstance(permission, dict):
+        return
+    mapped = _opencode_perms_to_claude(permission, ctx.report)
+    if not mapped:
+        return
+    dst = ctx.dst_root / "settings.json"
+    existing = load_json(dst) if dst.exists() else {}
+    perms = existing.setdefault("permissions", {})
+    for key, rules in mapped.items():
+        merged = list(perms.get(key) or [])
+        merged += [r for r in rules if r not in merged]
+        perms[key] = merged
+    write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+    ctx.report.migrated_lossy.append(
+        "permission → settings.json:permissions "
+        "(glob patterns approximated as prefix rules)")
+
+
+def _preview_codex_rules_opencode(ctx: Ctx) -> str:
+    n = 0
+    for f in sorted((ctx.src_root / "rules").glob("*.rules")):
+        n += len(_parse_prefix_rules(f.read_text(encoding="utf-8")))
+    return (f"{n} prefix rule(s) in rules/*.rules → "
+            "opencode.json:permission.bash")
+
+
+def _apply_codex_rules_opencode(ctx: Ctx) -> None:
+    bash: dict = {}
+    for f in sorted((ctx.src_root / "rules").glob("*.rules")):
+        for tokens, decision in _parse_prefix_rules(
+                f.read_text(encoding="utf-8")):
+            action = {"allow": "allow", "prompt": "ask",
+                      "forbidden": "deny"}.get(decision)
+            if action is None or tokens is None:
+                ctx.report.notes.append(
+                    f"rules/{f.name}: a prefix rule couldn't be translated "
+                    "(union pattern or unknown decision)")
+                continue
+            bash[f"{shlex.join(tokens)}*"] = action
+    if not bash:
+        return
+    opencode_update_config(ctx, {"permission": {"bash": bash}})
+    ctx.report.migrated_lossy.append(
+        f"rules/*.rules → opencode.json:permission.bash "
+        f"({len(bash)} pattern(s); prefix semantics approximated as globs)")
+
+
+def _detect_opencode_bash_rules(ctx: Ctx) -> bool:
+    permission = load_opencode_config(ctx.src_root).get("permission") or {}
+    return isinstance(permission, dict) and bool(permission.get("bash"))
+
+
+def _preview_opencode_bash_rules(ctx: Ctx) -> str:
+    bash = (load_opencode_config(ctx.src_root).get("permission") or {}).get("bash")
+    n = len(bash) if isinstance(bash, dict) else 1
+    return f"{n} permission.bash pattern(s) → rules/default.rules"
+
+
+def _apply_opencode_bash_rules(ctx: Ctx) -> None:
+    bash = (load_opencode_config(ctx.src_root).get("permission") or {}).get("bash")
+    if isinstance(bash, str):
+        bash = {"*": bash}
+    if not isinstance(bash, dict):
+        return
+    decision_map = {"allow": "allow", "ask": "prompt", "deny": "forbidden"}
+    dst = ctx.dst_root / "rules" / "default.rules"
+    existing = dst.read_text(encoding="utf-8") if dst.exists() else ""
+    lines: list[str] = []
+    for pattern, action in bash.items():
+        decision = decision_map.get(str(action))
+        base = str(pattern).rstrip("*").strip()
+        if decision is None or not base or "*" in base:
+            ctx.report.notes.append(
+                f"permission.bash: pattern {pattern!r} not expressible as a "
+                "Codex prefix rule")
+            continue
+        try:
+            tokens = shlex.split(base)
+        except ValueError:
+            ctx.report.notes.append(
+                f"permission.bash: pattern {pattern!r} has unbalanced "
+                "quoting — skipped")
+            continue
+        rendered = _render_prefix_rule(tokens, decision)
+        if rendered not in existing and rendered not in lines:
+            lines.append(rendered)
+    if not lines:
+        return
+    body = existing.rstrip() + "\n" if existing.strip() else ""
+    write_text(ctx, dst, body + "\n".join(lines) + "\n")
+    ctx.report.migrated_lossy.append(
+        f"permission.bash → rules/default.rules ({len(lines)} prefix "
+        "rule(s); glob semantics approximated as prefixes)")
+
+
+def _detect_claude_agents_opencode(ctx: Ctx) -> bool:
+    p = ctx.src_root / "agents"
+    return p.is_dir() and any(p.rglob("*.md"))
+
+
+def _preview_claude_agents_opencode(ctx: Ctx) -> str:
+    n = sum(1 for _ in (ctx.src_root / "agents").rglob("*.md"))
+    return (f"{n} subagent file(s) → opencode agents/*.md (mode: subagent; "
+            "tools/hooks/memory fields don't carry)")
+
+
+def _apply_claude_agents_opencode(ctx: Ctx) -> None:
+    _agents_write_opencode(ctx, _agents_read_claude(ctx.src_root), "claude")
+
+
 # ---- Catalog ---------------------------------------------------------------
 
 TIER_B: list[LossyOption] = [
@@ -2651,6 +3672,62 @@ TIER_B: list[LossyOption] = [
         preview=_preview_cursor_hooks,
         apply=_apply_cursor_hooks,
     ),
+    LossyOption(
+        id="permissions_opencode",
+        direction="claude->opencode",
+        label="permissions → opencode.json:permission",
+        rationale=("Claude prefix rules become opencode glob patterns. "
+                   "The intent carries, but opencode is last-match-wins "
+                   "where Claude is most-specific-wins — review the result."),
+        detect=_detect_claude_permissions_opencode,
+        preview=_preview_claude_permissions_opencode,
+        apply=_apply_claude_permissions_opencode,
+    ),
+    LossyOption(
+        id="opencode_permissions",
+        direction="opencode->claude",
+        label="permission → settings.json:permissions",
+        rationale=("opencode glob patterns become Claude prefix rules; "
+                   "mid-pattern wildcards and per-path edit maps can't be "
+                   "translated."),
+        detect=_detect_opencode_permissions,
+        preview=_preview_opencode_permissions,
+        apply=_apply_opencode_permissions,
+    ),
+    LossyOption(
+        id="rules_opencode",
+        direction="codex->opencode",
+        label="rules/*.rules → opencode.json:permission.bash",
+        rationale=("Codex prefix rules become opencode glob patterns "
+                   "(allow/prompt→ask/forbidden→deny). Union pattern "
+                   "elements can't be translated."),
+        detect=_detect_codex_rules,
+        preview=_preview_codex_rules_opencode,
+        apply=_apply_codex_rules_opencode,
+    ),
+    LossyOption(
+        id="opencode_rules",
+        direction="opencode->codex",
+        label="permission.bash → rules/default.rules",
+        rationale=("opencode bash glob patterns become Codex prefix rules; "
+                   "mid-pattern wildcards can't be expressed as prefixes."),
+        detect=_detect_opencode_bash_rules,
+        preview=_preview_opencode_bash_rules,
+        apply=_apply_opencode_bash_rules,
+    ),
+    LossyOption(
+        id="agents_opencode",
+        direction="claude->opencode",
+        label="agents/ → opencode agents/*.md (mode: subagent)",
+        rationale=("opencode runs subagents natively. name/description/"
+                   "model translate (provider-qualified); readOnly/plan "
+                   "permission modes become permission denies; Claude-only "
+                   "fields (tools, hooks, memory, skills, …) are dropped "
+                   "with notes."),
+        detect=_detect_claude_agents_opencode,
+        preview=_preview_claude_agents_opencode,
+        apply=_apply_claude_agents_opencode,
+    ),
 ]
 
 
@@ -2701,11 +3778,14 @@ def preflight(ctx: Ctx, direction_key: str,
     if (ctx.src_root / "CLAUDE.md").exists() or (ctx.src_root / "AGENTS.md").exists() \
             or (ctx.src_doc and ctx.src_doc.exists()):
         a_items.append("instruction doc (CLAUDE.md ↔ AGENTS.md)")
-    if (ctx.src_root / "commands").is_dir() or (ctx.src_root / "prompts").is_dir():
+    if (ctx.src_root / "commands").is_dir() or (ctx.src_root / "prompts").is_dir() \
+            or (ctx.src_root / "command").is_dir():
         a_items.append("slash commands ↔ prompts")
-    if _skill_dirs(ctx.src_root):
+    if _skill_dirs(ctx.src_root) or _skill_dirs(ctx.src_root, "skill"):
         a_items.append("skills (shared Agent Skills format)")
-    if (ctx.src_root / "settings.json").exists() or (ctx.src_root / "config.toml").exists():
+    if (ctx.src_root / "settings.json").exists() \
+            or (ctx.src_root / "config.toml").exists() \
+            or any(p.exists() for p in opencode_config_paths(ctx.src_root)):
         a_items.append("model + mcpServers + env + reasoning effort")
     for x in a_items:
         print(f"  ✓ {x}")
@@ -2776,9 +3856,9 @@ def run_codex_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     _run_lossy(ctx, lossy_decisions, "codex->claude")
 
 
-# Dispatch table for (from_tool, to_tool) pairs. All six directed pairs of
-# {claude, codex, cursor} are populated; same-tool pairs are rejected at the
-# CLI before reaching this dict.
+# Dispatch table for (from_tool, to_tool) pairs. Every directed pair of
+# TOOLS is populated; same-tool pairs are rejected at the CLI before
+# reaching this dict.
 RUNNERS: dict[tuple[str, str], Callable[[Ctx, dict[str, bool]], None]] = {
     ("claude", "codex"):  run_claude_to_codex,
     ("codex",  "claude"): run_codex_to_claude,
@@ -2786,6 +3866,12 @@ RUNNERS: dict[tuple[str, str], Callable[[Ctx, dict[str, bool]], None]] = {
     ("cursor", "claude"): run_cursor_to_claude,
     ("codex",  "cursor"): run_codex_to_cursor,
     ("cursor", "codex"):  run_cursor_to_codex,
+    ("claude",   "opencode"): run_claude_to_opencode,
+    ("opencode", "claude"):   run_opencode_to_claude,
+    ("codex",    "opencode"): run_codex_to_opencode,
+    ("opencode", "codex"):    run_opencode_to_codex,
+    ("cursor",   "opencode"): run_cursor_to_opencode,
+    ("opencode", "cursor"):   run_opencode_to_cursor,
 }
 
 
@@ -2802,7 +3888,7 @@ def find_latest_backup() -> Path | None:
     """
     bases: list[Path] = []
     for tool in TOOLS:
-        bases.append(Path.home() / f".{tool}" / "backups")
+        bases.append(_tool_user_root(tool) / "backups")
         bases.append(Path.cwd() / f".{tool}" / "backups")
 
     candidates: list[tuple[str, float, Path]] = []
@@ -2894,7 +3980,16 @@ def restore_from_backup(backup_path: Path, interactive: bool,
     return 0
 
 
-TOOLS = ("claude", "codex", "cursor")
+TOOLS = ("claude", "codex", "cursor", "opencode")
+
+
+def _tool_user_root(tool: str) -> Path:
+    """User-scope config root. opencode is the XDG outlier
+    (~/.config/opencode); everything else is a home dot-dir."""
+    home = Path.home()
+    if tool == "opencode":
+        return home / ".config" / "opencode"
+    return home / f".{tool}"
 
 
 def _tool_paths(tool: str, scope: str, override_dir: str | None) -> dict:
@@ -2907,21 +4002,20 @@ def _tool_paths(tool: str, scope: str, override_dir: str | None) -> dict:
     """
     if override_dir:
         return {"root": Path(override_dir).expanduser(), "doc": None}
-    home = Path.home()
     cwd = Path.cwd()
-    if tool == "claude":
-        return ({"root": home / ".claude", "doc": None} if scope == "user"
-                else {"root": cwd / ".claude", "doc": cwd / "CLAUDE.md"})
-    if tool == "codex":
-        return ({"root": home / ".codex", "doc": None} if scope == "user"
-                else {"root": cwd / ".codex", "doc": cwd / "AGENTS.md"})
-    if tool == "cursor":
-        # Cursor has no user-level rules — only global MCP at ~/.cursor/mcp.json.
-        # Project rules live in <repo>/.cursor/rules/*.mdc and the legacy
-        # <repo>/.cursorrules sits alongside.
-        return ({"root": home / ".cursor", "doc": None} if scope == "user"
-                else {"root": cwd / ".cursor", "doc": cwd / ".cursorrules"})
-    raise ValueError(f"unknown tool: {tool}")
+    if scope == "user":
+        return {"root": _tool_user_root(tool), "doc": None}
+    project_docs = {
+        "claude": cwd / "CLAUDE.md",
+        "codex": cwd / "AGENTS.md",
+        # Cursor reads project AGENTS.md natively now, but the legacy
+        # .cursorrules still marks the project root for rule reading.
+        "cursor": cwd / ".cursorrules",
+        "opencode": cwd / "AGENTS.md",
+    }
+    if tool not in project_docs:
+        raise ValueError(f"unknown tool: {tool}")
+    return {"root": cwd / f".{tool}", "doc": project_docs[tool]}
 
 
 def _csv_set(s: str | None) -> set[str] | None:
@@ -2949,6 +4043,7 @@ def main() -> int:
     ap.add_argument("--claude-dir")
     ap.add_argument("--codex-dir")
     ap.add_argument("--cursor-dir")
+    ap.add_argument("--opencode-dir")
     ap.add_argument("--dry-run", action="store_true")
     mg = ap.add_mutually_exclusive_group()
     mg.add_argument("--merge", dest="merge", action="store_true", default=True)
@@ -2979,8 +4074,8 @@ def main() -> int:
             backup_path = find_latest_backup()
             if not backup_path:
                 print("No backups found under any tool's backups dir "
-                      "(~/.claude, ~/.codex, ~/.cursor, or ./.<tool>).",
-                      file=sys.stderr)
+                      "(~/.claude, ~/.codex, ~/.cursor, ~/.config/opencode, "
+                      "or ./.<tool>).", file=sys.stderr)
                 return 1
             print(f"Using latest backup: {backup_path}")
         else:
@@ -3011,6 +4106,7 @@ def main() -> int:
         "claude": args.claude_dir,
         "codex": args.codex_dir,
         "cursor": args.cursor_dir,
+        "opencode": args.opencode_dir,
     }
     scopes = ["user", "project"] if args.scope == "both" else [args.scope]
 
@@ -3020,7 +4116,8 @@ def main() -> int:
         src_root, dst_root = src["root"], dst["root"]
         src_doc, dst_doc = src["doc"], dst["doc"]
 
-        pretty = {"claude": "Claude Code", "codex": "Codex CLI", "cursor": "Cursor"}
+        pretty = {"claude": "Claude Code", "codex": "Codex CLI",
+                  "cursor": "Cursor", "opencode": "opencode"}
         label = (f"{pretty[from_tool]} → {pretty[to_tool]} "
                  f"({src_root} → {dst_root})")
 
