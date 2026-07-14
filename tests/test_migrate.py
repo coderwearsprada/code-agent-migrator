@@ -1449,6 +1449,108 @@ class OpencodeRunnerTests(FsTestBase):
                             for s in ctx.report.skipped_unmappable))
 
 
+class PiRunnerTests(FsTestBase):
+    def test_claude_to_pi_end_to_end(self):
+        (self.src / "CLAUDE.md").write_text("Instructions.\n")
+        (self.src / "settings.json").write_text(json.dumps({
+            "model": "claude-opus-4-8",
+            "effortLevel": "max",  # legacy alias normalizes to xhigh
+            "mcpServers": {"x": {"command": "srv"}},
+            "hooks": {"Stop": [{"hooks": [{"type": "command",
+                                           "command": "x"}]}]},
+        }))
+        cmds = self.src / "commands"
+        cmds.mkdir()
+        (cmds / "ship.md").write_text(
+            "---\ndescription: Ship\nargument-hint: [env]\n---\nShip $1.\n")
+
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_pi(ctx, lossy_decisions={})
+
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(settings["defaultProvider"], "anthropic")
+        self.assertEqual(settings["defaultModel"], "claude-opus-4-8")
+        self.assertEqual(settings["defaultThinkingLevel"], "xhigh")
+        # pi prompt templates share Claude's command frontmatter keys.
+        _, fm = m.strip_frontmatter((self.dst / "prompts" / "ship.md").read_text())
+        self.assertEqual(fm, {"description": "Ship", "argument-hint": "[env]"})
+        # pi has no MCP and no hooks — both reported.
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        self.assertIn("MCP", skipped)
+        self.assertIn("hooks", skipped)
+
+    def test_pi_to_claude_maps_thinking_and_provider(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "defaultProvider": "openai",
+            "defaultModel": "gpt-5.6",
+            "defaultThinkingLevel": "max",
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_claude(ctx, lossy_decisions={})
+
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(settings["model"], "gpt-5.6")
+        # pi's max sits above xhigh; Claude tops out at xhigh.
+        self.assertEqual(settings["effortLevel"], "xhigh")
+        # Cross-provider model — flagged for review.
+        self.assertTrue(any("openai" in n for n in ctx.report.notes))
+
+    def test_thinking_level_off_is_reported_not_dropped(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "defaultThinkingLevel": "off",
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_claude(ctx, lossy_decisions={})
+        self.assertFalse((self.dst / "settings.json").exists())
+        self.assertTrue(any("defaultThinkingLevel" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_codex_pi_prompts_round_trip_verbatim(self):
+        prompts = self.src / "prompts"
+        prompts.mkdir()
+        text = "---\ndescription: Sum\nargument-hint: [x]\n---\nSum $1.\n"
+        (prompts / "sum.md").write_text(text)
+        mid = self.tmp / "mid"
+        mid.mkdir()
+        m.tier_a_prompts_copy(make_ctx(self.src, mid))
+        m.tier_a_prompts_copy(make_ctx(mid, self.dst))
+        self.assertEqual((self.dst / "prompts" / "sum.md").read_text(), text)
+
+    def test_bare_pi_skill_becomes_skill_dir(self):
+        skills = self.src / "skills"
+        skills.mkdir()
+        (skills / "quick.md").write_text("# Quick helper\nDoes things.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m.skills_from_pi(ctx)
+
+        out = (self.dst / "skills" / "quick" / "SKILL.md").read_text()
+        body, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm["name"], "quick")
+        self.assertEqual(fm["description"], "Quick helper")
+        self.assertIn("Does things.", body)
+        self.assertTrue(any("synthesized" in n for n in ctx.report.notes))
+
+    def test_pi_to_opencode_joins_provider_and_model(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "defaultProvider": "anthropic",
+            "defaultModel": "claude-sonnet-4-5",
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_opencode(ctx, lossy_decisions={})
+        cfg = json.loads((self.dst / "opencode.json").read_text())
+        self.assertEqual(cfg["model"], "anthropic/claude-sonnet-4-5")
+
+    def test_codex_to_pi_carries_minimal_effort(self):
+        (self.src / "config.toml").write_text(
+            'model = "gpt-5.6"\nmodel_reasoning_effort = "minimal"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.run_codex_to_pi(ctx, lossy_decisions={})
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(settings["defaultProvider"], "openai")
+        # pi's thinking scale is a superset of Codex's — minimal survives.
+        self.assertEqual(settings["defaultThinkingLevel"], "minimal")
+
+
 class FindLatestBackupTests(FsTestBase):
     """find_latest_backup must consider every tool's backups dir, ordered
     by the manifest's created_at, so consecutive migrations across

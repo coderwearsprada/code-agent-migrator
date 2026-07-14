@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 migrate.py — Migrate settings + custom configuration between Claude Code
-(~/.claude), Codex CLI (~/.codex), Cursor (~/.cursor), and opencode
-(~/.config/opencode), in any pairwise direction.
+(~/.claude), Codex CLI (~/.codex), Cursor (~/.cursor), opencode
+(~/.config/opencode), and pi (~/.pi/agent), in any pairwise direction.
 
 Requires Python 3.9+. No third-party dependencies.
 
@@ -1785,6 +1785,442 @@ def _opencode_perms_to_claude(permission: dict, report: Report) -> dict:
             report.notes.append(
                 f"permission.{tool} has no Claude permissions equivalent")
     return {k: sorted(set(v)) for k, v in out.items() if v}
+
+
+# ============================================================================
+# pi — I/O helpers
+# ============================================================================
+# pi (pi.dev, earendil-works/pi) keeps user config in ~/.pi/agent/ and
+# project config in .pi/. It reads AGENTS.md *or* CLAUDE.md natively
+# (global + walking up from cwd), speaks the Agent Skills standard
+# (skills/<name>/SKILL.md, plus bare skills/*.md files), and its prompt
+# templates (prompts/*.md, description/argument-hint frontmatter,
+# $ARGUMENTS substitution) are format-identical to Codex custom prompts.
+# settings.json carries defaultProvider/defaultModel/defaultThinkingLevel.
+# pi deliberately has NO MCP, NO subagents, and NO hooks (extensions are
+# TypeScript code) — those source features become report notes, so every
+# pi pair is Tier A only.
+
+PI_THINKING_TO_CLAUDE = {
+    "minimal": "low", "low": "low", "medium": "medium", "high": "high",
+    "xhigh": "xhigh", "max": "xhigh",  # pi keeps a max above xhigh; Claude doesn't
+}
+PI_THINKING_TO_CODEX = {
+    "minimal": "minimal", "low": "low", "medium": "medium", "high": "high",
+    "xhigh": "xhigh", "max": "xhigh",
+}
+
+PI_UNMAPPABLE_SETTINGS = (
+    "theme", "enabledModels", "thinkingBudgets", "defaultProjectTrust",
+    "externalEditor", "quietStartup", "hideThinkingBlock", "steeringMode",
+    "followUpMode", "transport", "compaction", "retry", "terminal",
+    "images", "shellPath", "shellCommandPrefix", "npmCommand", "sessionDir",
+    "httpProxy", "packages", "extensions", "themes",
+)
+
+
+def load_pi_settings(root: Path) -> dict:
+    return load_json(root / "settings.json")
+
+
+def pi_update_settings(ctx: Ctx, updates: dict) -> None:
+    dst = ctx.dst_root / "settings.json"
+    existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+    existing.update(updates)
+    write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+
+
+def pi_report_unmappables(ctx: Ctx, settings: dict) -> None:
+    for k in PI_UNMAPPABLE_SETTINGS:
+        if k in settings:
+            ctx.report.skipped_unmappable.append(
+                f"settings.json:{k} (pi-only — no equivalent)")
+    for f in ("SYSTEM.md", "APPEND_SYSTEM.md", "keybindings.json",
+              "models.json"):
+        if (ctx.src_root / f).exists():
+            ctx.report.skipped_unmappable.append(
+                f"{f} (pi-only — system prompt/keybinding/provider config "
+                "has no equivalent; models.json may contain secrets)")
+
+
+def _pi_feature_gap_notes(ctx: Ctx, mcp: bool = False, agents: bool = False,
+                          hooks: bool = False, permissions: bool = False) -> None:
+    """Source features pi deliberately doesn't have. Reported once each so
+    nothing silently disappears."""
+    if mcp:
+        ctx.report.skipped_unmappable.append(
+            "MCP servers (pi has no MCP — wrap the server as a CLI tool "
+            "with a skill instead)")
+    if agents:
+        ctx.report.skipped_unmappable.append(
+            "subagents (core pi has none — see the pi-subagents community "
+            "package if you need them)")
+    if hooks:
+        ctx.report.skipped_unmappable.append(
+            "hooks (pi extensions are TypeScript code, not configurable "
+            "hooks — port by hand)")
+    if permissions:
+        ctx.report.skipped_unmappable.append(
+            "permission rules (pi uses per-project trust, not per-command "
+            "rules)")
+
+
+def skills_from_pi(ctx: Ctx) -> None:
+    """Skills out of pi: standard skill dirs copy verbatim; pi also treats
+    bare skills/*.md files as skills — those become <name>/SKILL.md dirs
+    (the only layout the other tools read), synthesizing name/description
+    frontmatter when the bare file lacks it."""
+    tier_a_skills_copy(ctx)
+    skills_root = ctx.src_root / "skills"
+    if not skills_root.is_dir():
+        return
+    for f in sorted(skills_root.glob("*.md")):
+        text = f.read_text(encoding="utf-8")
+        body, fm = strip_frontmatter(text)
+        fm = fm or {}
+        name = safe_skill_name(fm.get("name") or f.stem)
+        if fm.get("name") and fm.get("description"):
+            content = text
+        else:
+            merged = dict(fm)
+            merged["name"] = name
+            merged.setdefault(
+                "description",
+                _first_heading(body) or f"Migrated pi skill {name}")
+            # name/description lead; any other keys keep their values.
+            ordered = {"name": merged.pop("name"),
+                       "description": merged.pop("description"), **merged}
+            content = make_frontmatter(ordered) + body.lstrip("\n")
+            ctx.report.notes.append(
+                f"skills/{f.name}: synthesized missing name/description "
+                "frontmatter for the SKILL.md standard")
+        write_text(ctx, ctx.dst_root / "skills" / name / "SKILL.md", content)
+        ctx.report.migrated_clean.append(
+            f"skills/{f.name} → skills/{name}/SKILL.md (bare pi skill file)")
+
+
+def copy_instruction_doc(ctx: Ctx, src_doc: Path, dst_doc: Path,
+                         native_note: str) -> None:
+    """AGENTS.md-style doc copy between tools that both read it natively;
+    same-file cases (shared project root) become a note instead."""
+    if not src_doc.exists():
+        return
+    if src_doc == dst_doc:
+        ctx.report.notes.append(native_note)
+        return
+    body = src_doc.read_text(encoding="utf-8").rstrip() + "\n"
+    if dst_doc.exists() and ctx.merge:
+        existing = dst_doc.read_text(encoding="utf-8").rstrip()
+        body = existing + "\n\n" + body if existing else body
+    write_text(ctx, dst_doc, body)
+    ctx.report.migrated_clean.append(f"{src_doc.name} → {dst_doc.name}")
+
+
+def tier_a_prompts_copy(ctx: Ctx) -> None:
+    """Codex prompts ↔ pi prompt templates — the formats are identical
+    (description/argument-hint frontmatter, $ARGUMENTS/$1 substitution),
+    so files transfer as-is; legacy migrator:meta comments from old
+    migrations are normalized back to frontmatter."""
+    src_dir = ctx.src_root / "prompts"
+    if not src_dir.is_dir():
+        return
+    for f in sorted(src_dir.rglob("*.md")):
+        rel = f.relative_to(src_dir)
+        text = f.read_text(encoding="utf-8")
+        body, fm = strip_frontmatter(text)
+        if fm is None:
+            body, fm = meta_comment_to_frontmatter(text)
+        out = (make_frontmatter(fm) if fm else "") + body
+        write_text(ctx, ctx.dst_root / "prompts" / rel, out)
+        ctx.report.migrated_clean.append(f"prompts/{rel} → prompts/{rel}")
+
+
+def _pi_thinking_out(ctx: Ctx, settings: dict, table: dict) -> str | None:
+    level = settings.get("defaultThinkingLevel")
+    if not isinstance(level, str):
+        return None
+    mapped = table.get(level)
+    if mapped is None:
+        ctx.report.skipped_unmappable.append(
+            f"settings.json:defaultThinkingLevel={level!r} (no equivalent)")
+        return None
+    if level == "max":
+        ctx.report.notes.append(
+            "pi thinking level 'max' sits above 'xhigh'; mapped to the "
+            "destination's highest level")
+    return mapped
+
+
+# ---- pi direction runners ---------------------------------------------------
+
+def run_claude_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    tier_a_docs_claude_to_codex(ctx)  # CLAUDE.md (+rules/outputStyle) → AGENTS.md
+    ctx.report.notes.append(
+        "pi also reads CLAUDE.md natively — the AGENTS.md copy makes the "
+        "config self-contained")
+    tier_a_commands_to_prompts(ctx)   # description/argument-hint match pi's format
+    tier_a_skills_copy(ctx)
+
+    settings = load_claude_settings(ctx.src_root)
+    updates: dict = {}
+    if isinstance(settings.get("model"), str):
+        updates["defaultProvider"] = "anthropic"
+        updates["defaultModel"] = settings["model"]
+        ctx.report.migrated_clean.append(
+            "settings.json:model → defaultProvider/defaultModel")
+    effort = settings.get("effortLevel")
+    if isinstance(effort, str):
+        mapped = EFFORT_C2X.get(effort)  # normalizes legacy max → xhigh
+        if mapped:
+            updates["defaultThinkingLevel"] = mapped
+            ctx.report.migrated_clean.append(
+                f"effortLevel={effort} → defaultThinkingLevel={mapped}")
+    if updates:
+        pi_update_settings(ctx, updates)
+
+    _pi_feature_gap_notes(
+        ctx,
+        mcp=bool(claude_read_mcp(ctx)),
+        agents=(ctx.src_root / "agents").is_dir()
+        and any((ctx.src_root / "agents").rglob("*.md")),
+        hooks=bool(settings.get("hooks")),
+        permissions=bool(settings.get("permissions")),
+    )
+    for key in ("env", "statusLine", "outputStyle"):
+        if settings.get(key):
+            ctx.report.skipped_unmappable.append(
+                f"settings.json:{key} (no pi equivalent)")
+
+    _run_lossy(ctx, lossy_decisions, "claude->pi")
+
+
+def run_pi_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    tier_a_docs_codex_to_claude(ctx)  # AGENTS.md → CLAUDE.md (@import at project)
+    tier_a_prompts_to_commands(ctx)
+    skills_from_pi(ctx)
+
+    settings = load_pi_settings(ctx.src_root)
+    dst = ctx.dst_root / "settings.json"
+    existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+    changed = False
+    if isinstance(settings.get("defaultModel"), str):
+        existing["model"] = settings["defaultModel"]
+        changed = True
+        ctx.report.migrated_clean.append(
+            "defaultModel → settings.json:model")
+        provider = settings.get("defaultProvider")
+        if provider and provider != "anthropic":
+            ctx.report.notes.append(
+                f"model came from provider {provider!r} — verify Claude "
+                "Code can run it")
+    mapped = _pi_thinking_out(ctx, settings, PI_THINKING_TO_CLAUDE)
+    if mapped:
+        existing["effortLevel"] = mapped
+        changed = True
+        ctx.report.migrated_clean.append(
+            f"defaultThinkingLevel → effortLevel={mapped}")
+    if changed:
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+    pi_report_unmappables(ctx, settings)
+
+    _run_lossy(ctx, lossy_decisions, "pi->claude")
+
+
+def run_codex_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = (ctx.src_doc if ctx.src_doc and ctx.src_doc.exists()
+               else ctx.src_root / "AGENTS.md")
+    copy_instruction_doc(
+        ctx, src_doc, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"),
+        "AGENTS.md at the project root is read natively by both tools — "
+        "no translation needed")
+    tier_a_prompts_copy(ctx)
+    tier_a_skills_copy(ctx)
+
+    cfg = load_toml(ctx.src_root / "config.toml")
+    updates: dict = {}
+    if isinstance(cfg.get("model"), str):
+        updates["defaultProvider"] = "openai"
+        updates["defaultModel"] = cfg["model"]
+        ctx.report.migrated_clean.append(
+            "config.toml:model → defaultProvider/defaultModel")
+    effort = cfg.get("model_reasoning_effort")
+    if isinstance(effort, str):
+        updates["defaultThinkingLevel"] = effort  # pi accepts Codex's full range
+        ctx.report.migrated_clean.append(
+            f"model_reasoning_effort={effort} → defaultThinkingLevel")
+    if updates:
+        pi_update_settings(ctx, updates)
+
+    _pi_feature_gap_notes(
+        ctx,
+        mcp=bool(cfg.get("mcp_servers")),
+        agents=(ctx.src_root / "agents").is_dir()
+        and any((ctx.src_root / "agents").glob("*.toml")),
+        hooks=bool(cfg.get("notify")
+                   or load_json(ctx.src_root / "hooks.json").get("hooks")),
+        permissions=(ctx.src_root / "rules").is_dir()
+        or any(k in cfg for k in ("sandbox_mode", "approval_policy")),
+    )
+
+    _run_lossy(ctx, lossy_decisions, "codex->pi")
+
+
+def run_pi_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = ctx.src_root / "AGENTS.md"
+    if ctx.src_doc and ctx.src_doc.exists():
+        src_doc = ctx.src_doc
+    copy_instruction_doc(
+        ctx, src_doc, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"),
+        "AGENTS.md at the project root is read natively by both tools — "
+        "no translation needed")
+    tier_a_prompts_copy(ctx)
+    skills_from_pi(ctx)
+
+    settings = load_pi_settings(ctx.src_root)
+    dst = ctx.dst_root / "config.toml"
+    existing = load_toml(dst) if (ctx.merge and dst.exists()) else {}
+    changed = False
+    if isinstance(settings.get("defaultModel"), str):
+        existing["model"] = settings["defaultModel"]
+        changed = True
+        ctx.report.migrated_clean.append("defaultModel → config.toml:model")
+        provider = settings.get("defaultProvider")
+        if provider and provider != "openai":
+            ctx.report.notes.append(
+                f"model came from provider {provider!r} — verify Codex can "
+                "run it")
+    mapped = _pi_thinking_out(ctx, settings, PI_THINKING_TO_CODEX)
+    if mapped:
+        existing["model_reasoning_effort"] = mapped
+        changed = True
+        ctx.report.migrated_clean.append(
+            f"defaultThinkingLevel → model_reasoning_effort={mapped}")
+    if changed:
+        write_text(ctx, dst, render_toml(existing))
+    pi_report_unmappables(ctx, settings)
+
+    _run_lossy(ctx, lossy_decisions, "pi->codex")
+
+
+def run_cursor_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    rules = cursor_read_rules(ctx.src_root)
+    if rules:
+        doc = cursor_rules_to_doc(rules)
+        dst_doc = ctx.dst_doc or (ctx.dst_root / "AGENTS.md")
+        if dst_doc.exists() and ctx.merge:
+            doc = dst_doc.read_text(encoding="utf-8").rstrip() + "\n\n" + doc
+        write_text(ctx, dst_doc, doc + "\n")
+        ctx.report.migrated_clean.append(
+            f"{len(rules)} cursor rule(s) → {dst_doc.name}")
+    tier_a_skills_copy(ctx)
+
+    model = cursor_cli_config_read_model(ctx.src_root)
+    if model:
+        pi_update_settings(ctx, {"defaultModel": model})
+        ctx.report.migrated_clean.append(
+            "cli-config.json:model → defaultModel")
+        ctx.report.notes.append(
+            "defaultProvider was not set (Cursor doesn't record one) — "
+            "set it in ~/.pi/agent/settings.json if needed")
+    _pi_feature_gap_notes(
+        ctx,
+        mcp=bool(cursor_read_mcp(ctx.src_root)),
+        agents=(ctx.src_root / "agents").is_dir()
+        and any((ctx.src_root / "agents").rglob("*.md")),
+        hooks=bool(load_json(ctx.src_root / "hooks.json").get("hooks")),
+    )
+
+    _run_lossy(ctx, lossy_decisions, "cursor->pi")
+
+
+def run_pi_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = ctx.src_root / "AGENTS.md"
+    if ctx.src_doc and ctx.src_doc.exists():
+        src_doc = ctx.src_doc
+    project_dst = cursor_project_root_from(ctx.dst_root)
+    if (project_dst and src_doc.exists()
+            and src_doc == project_dst / "AGENTS.md"):
+        ctx.report.notes.append(
+            "AGENTS.md at the project root is read natively by Cursor — "
+            "no translation needed")
+    elif src_doc.exists():
+        rules = doc_to_cursor_rules(src_doc.read_text(encoding="utf-8"))
+        if rules:
+            cursor_write_rules(rules, ctx.dst_root, ctx)
+            ctx.report.migrated_clean.append(
+                f"AGENTS.md → {len(rules)} cursor rule file(s)")
+    tier_a_commands_to_cursor_skills(ctx, "prompts", "prompts")
+    skills_from_pi(ctx)
+
+    settings = load_pi_settings(ctx.src_root)
+    if isinstance(settings.get("defaultModel"), str):
+        cursor_cli_config_write_model(ctx, settings["defaultModel"])
+        ctx.report.migrated_clean.append(
+            "defaultModel → cli-config.json:model")
+    pi_report_unmappables(ctx, settings)
+
+    _run_lossy(ctx, lossy_decisions, "pi->cursor")
+
+
+def run_opencode_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = ctx.src_root / "AGENTS.md"
+    project_src = _opencode_project_root(ctx.src_root)
+    if project_src and (project_src / "AGENTS.md").exists():
+        src_doc = project_src / "AGENTS.md"
+    copy_instruction_doc(
+        ctx, src_doc, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"),
+        "AGENTS.md at the project root is read natively by both tools — "
+        "no translation needed")
+    tier_a_opencode_commands_to(ctx, "prompts")
+    _skills_copy_from_opencode(ctx)
+
+    cfg = load_opencode_config(ctx.src_root)
+    if isinstance(cfg.get("model"), str):
+        model_id, provider = model_from_opencode(cfg["model"])
+        updates: dict = {"defaultModel": model_id}
+        if provider:
+            updates["defaultProvider"] = provider
+        pi_update_settings(ctx, updates)
+        ctx.report.migrated_clean.append(
+            "opencode.json:model → defaultProvider/defaultModel")
+    _pi_feature_gap_notes(
+        ctx,
+        mcp=bool(cfg.get("mcp")),
+        agents=any(_opencode_subdirs(ctx.src_root, "agents")),
+        permissions=bool(cfg.get("permission")),
+    )
+    _opencode_report_unmappables(ctx, cfg)
+
+    _run_lossy(ctx, lossy_decisions, "opencode->pi")
+
+
+def run_pi_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = ctx.src_root / "AGENTS.md"
+    if ctx.src_doc and ctx.src_doc.exists():
+        src_doc = ctx.src_doc
+    opencode_docs_note_or_copy(ctx, src_doc)
+    tier_a_commands_to_opencode(ctx, "prompts")
+    skills_from_pi(ctx)
+
+    settings = load_pi_settings(ctx.src_root)
+    if isinstance(settings.get("defaultModel"), str):
+        provider = settings.get("defaultProvider")
+        model = (f"{provider}/{settings['defaultModel']}" if provider
+                 else settings["defaultModel"])
+        opencode_update_config(ctx, {"model": model})
+        ctx.report.migrated_clean.append(
+            f"defaultProvider/defaultModel → opencode.json:model={model}")
+        if not provider:
+            ctx.report.notes.append(
+                "opencode model ids are provider-qualified — check "
+                f"`{settings['defaultModel']}` resolves")
+    if settings.get("defaultThinkingLevel"):
+        ctx.report.skipped_unmappable.append(
+            "settings.json:defaultThinkingLevel (opencode has no "
+            "reasoning-effort knob)")
+    pi_report_unmappables(ctx, settings)
+
+    _run_lossy(ctx, lossy_decisions, "pi->opencode")
 
 
 # ============================================================================
@@ -3872,6 +4308,14 @@ RUNNERS: dict[tuple[str, str], Callable[[Ctx, dict[str, bool]], None]] = {
     ("opencode", "codex"):    run_opencode_to_codex,
     ("cursor",   "opencode"): run_cursor_to_opencode,
     ("opencode", "cursor"):   run_opencode_to_cursor,
+    ("claude",   "pi"): run_claude_to_pi,
+    ("pi", "claude"):   run_pi_to_claude,
+    ("codex",    "pi"): run_codex_to_pi,
+    ("pi", "codex"):    run_pi_to_codex,
+    ("cursor",   "pi"): run_cursor_to_pi,
+    ("pi", "cursor"):   run_pi_to_cursor,
+    ("opencode", "pi"): run_opencode_to_pi,
+    ("pi", "opencode"): run_pi_to_opencode,
 }
 
 
@@ -3980,15 +4424,18 @@ def restore_from_backup(backup_path: Path, interactive: bool,
     return 0
 
 
-TOOLS = ("claude", "codex", "cursor", "opencode")
+TOOLS = ("claude", "codex", "cursor", "opencode", "pi")
 
 
 def _tool_user_root(tool: str) -> Path:
     """User-scope config root. opencode is the XDG outlier
-    (~/.config/opencode); everything else is a home dot-dir."""
+    (~/.config/opencode) and pi nests under ~/.pi/agent; everything else
+    is a home dot-dir."""
     home = Path.home()
     if tool == "opencode":
         return home / ".config" / "opencode"
+    if tool == "pi":
+        return home / ".pi" / "agent"
     return home / f".{tool}"
 
 
@@ -4012,6 +4459,7 @@ def _tool_paths(tool: str, scope: str, override_dir: str | None) -> dict:
         # .cursorrules still marks the project root for rule reading.
         "cursor": cwd / ".cursorrules",
         "opencode": cwd / "AGENTS.md",
+        "pi": cwd / "AGENTS.md",
     }
     if tool not in project_docs:
         raise ValueError(f"unknown tool: {tool}")
@@ -4044,6 +4492,7 @@ def main() -> int:
     ap.add_argument("--codex-dir")
     ap.add_argument("--cursor-dir")
     ap.add_argument("--opencode-dir")
+    ap.add_argument("--pi-dir")
     ap.add_argument("--dry-run", action="store_true")
     mg = ap.add_mutually_exclusive_group()
     mg.add_argument("--merge", dest="merge", action="store_true", default=True)
@@ -4107,6 +4556,7 @@ def main() -> int:
         "codex": args.codex_dir,
         "cursor": args.cursor_dir,
         "opencode": args.opencode_dir,
+        "pi": args.pi_dir,
     }
     scopes = ["user", "project"] if args.scope == "both" else [args.scope]
 
@@ -4117,7 +4567,7 @@ def main() -> int:
         src_doc, dst_doc = src["doc"], dst["doc"]
 
         pretty = {"claude": "Claude Code", "codex": "Codex CLI",
-                  "cursor": "Cursor", "opencode": "opencode"}
+                  "cursor": "Cursor", "opencode": "opencode", "pi": "pi"}
         label = (f"{pretty[from_tool]} → {pretty[to_tool]} "
                  f"({src_root} → {dst_root})")
 
