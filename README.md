@@ -13,18 +13,18 @@ Requires Python 3.9+. No third-party dependencies. On 3.11+ it uses the
 stdlib `tomllib`; on 3.9/3.10 it falls back to a small bundled TOML reader
 covering the subset Codex's `config.toml` uses.
 
-**Tested against:** Claude Code `2.1.207`, Codex CLI `0.137.0` (schemas
-cross-checked against the 0.144 docs), Cursor 2.4+/3.x schemas, opencode
-1.x schemas (config.json schema + docs), and pi 0.80.x docs, all as of
-2026-07. The script reads documented config schemas, so minor version bumps
+**Tested against:** Claude Code `2.1.207` (schemas cross-checked with the
+2.1.220 docs), Codex CLI `0.137.0` (schemas cross-checked with the 0.145
+docs and source), Cursor 3.x schemas, opencode 1.18.x schemas, and pi
+0.82.x docs, all as of 2026-07-28. The script reads documented config schemas, so minor version bumps
 should keep working; if a future release renames or removes a key, the
 migrator will flag it as "not translated" in the report rather than corrupt
 your config.
 
-> Codex CLI 0.140+ ships its own interactive `/import` command for pulling
-> Claude Code config in. This migrator remains useful for the other five
-> directions, for scriptable/non-interactive runs, and for the backup +
-> restore safety net.
+> Codex CLI ships its own interactive `/import` command (0.145 imports
+> from both Claude Code and Cursor). This migrator remains useful for the
+> remaining directions, for scriptable/non-interactive runs, and for the
+> backup + restore safety net.
 
 ## Usage
 
@@ -143,7 +143,7 @@ read; plural canonical dirs are written.
 | `AGENTS.md`                            | `CLAUDE.md` / `AGENTS.md` / cursor rules. pi reads AGENTS.md *and* CLAUDE.md natively, so same-file project cases become a report note. |
 | `prompts/*.md` (`description`, `argument-hint`) | Claude `commands/`, Codex `prompts/` (verbatim — the formats are identical), Cursor slash-invocable skills, opencode `commands/`. |
 | `settings.json:defaultProvider` + `defaultModel` | `settings.json:model` / `config.toml:model` / `cli-config.json:model` / opencode's `provider/model` — the provider field makes this the cleanest model mapping of any pair; cross-provider moves get a review note. |
-| `settings.json:defaultThinkingLevel`   | `effortLevel` / `model_reasoning_effort`. pi's scale is a superset (`off`…`xhigh`, `max`): `max` maps down to `xhigh` with a note, `off` is reported, and Codex's `minimal` survives a round trip. |
+| `settings.json:defaultThinkingLevel`   | `effortLevel` / `model_reasoning_effort`. pi ↔ Codex is 1:1 (`off`↔`none`, `minimal`…`xhigh`, `max`↔`max`); toward Claude, `max` maps down to `xhigh` with a note and `off` is reported. Templates using pi's `${1:-default}` shell substitutions are flagged on the way out. |
 
 pi deliberately has **no MCP, no subagents, and no hooks** (extensions are
 TypeScript code). Migrating *to* pi reports those source features as not
@@ -175,10 +175,16 @@ Notes:
   `env_http_headers`) don't leave Codex.
 - Effort levels (Claude `effortLevel` ↔ Codex `model_reasoning_effort`)
   share the `low`/`medium`/`high`/`xhigh` vocabulary and map 1:1. Codex's
-  extra `minimal` maps to Claude `low`; the legacy Claude `max` alias (the
-  pre-2.1 name for `xhigh`) maps to Codex `xhigh`. Cursor has no global
-  reasoning-effort knob, so this field is reported but not carried (agent
-  files use Cursor's `model[effort=…]` bracket syntax, which does map).
+  scale is wider (`none`, `minimal`, and since ~0.145 first-class `max`
+  and `ultra` tiers): `minimal` maps to Claude `low`, `max`/`ultra`
+  collapse to Claude `xhigh` with a report note, and `none` is reported
+  as untranslatable. pi's `off…max` scale maps 1:1 with Codex
+  (`off`↔`none`, `max`↔`max`; only Codex `ultra` collapses to pi `max`).
+  The legacy Claude `max` alias (the pre-2.1 name for `xhigh`) maps to
+  Codex `xhigh`. Cursor has no global reasoning-effort knob, so this
+  field is reported but not carried (agent files use Cursor's
+  `model[effort=…]` bracket syntax, which does map — other bracket
+  params like `context=`/`fast=` are flagged as dropped).
 - At project scope, Cursor reads `AGENTS.md` natively, so codex→cursor
   leaves it in place and notes that instead of splitting it into rules.
 
@@ -193,8 +199,8 @@ lets you accept or skip per-item (interactively, or via
 
 | Target | ID | Translation | Why lossy |
 |---|---|---|---|
-| Codex  | `permissions`     | `permissions.allow/deny/ask` → `sandbox_mode` + `approval_policy` + `rules/default.rules` | Overall posture collapses into coarse sandbox modes; `Bash(...)` rules become Starlark `prefix_rule()` entries (exact-match rules widen to prefix matches); `Write()` patterns become `writable_roots`; `WebFetch`/`WebSearch` deny becomes `network_access=false`. |
-| Codex  | `hooks`           | `hooks` → `.codex/hooks.json` + `Notification` → `notify` | Codex hooks share Claude's event names/shape, so command hooks on shared events (PreToolUse, PostToolUse, Stop, …) translate near-verbatim. Non-command hook types (http, mcp_tool, prompt, agent) and Claude-only events (SessionEnd, FileChanged, …) are dropped. |
+| Codex  | `permissions`     | `permissions.allow/deny/ask` → `sandbox_mode` + `approval_policy` + `rules/default.rules` | Overall posture collapses into coarse sandbox modes; `Bash(...)` rules become Starlark `prefix_rule()` entries (exact-match rules widen to prefix matches); `Write()` patterns become `writable_roots`; `WebFetch`/`WebSearch` deny becomes `network_access=false`. Codex 0.145+ auto-strips `allow` rules for protected commands (shells, interpreters, package runners) on first launch — the report flags any it may delete. |
+| Codex  | `hooks`           | `hooks` → `.codex/hooks.json` + `Notification` → `notify` | Codex hooks share Claude's event names/shape, so command hooks on shared events (PreToolUse, PostToolUse, Stop, SessionEnd, …) translate near-verbatim. Non-command hook types (http, mcp_tool, prompt, agent) and Claude-only events (FileChanged, …) are dropped. |
 | Codex  | `agents`          | `agents/*.md` → `.codex/agents/*.toml` | Claude subagents become Codex custom agents. `name`, `description`, `model`, `effort`, and selected `permissionMode` values map to TOML; skills/tool lists become prompt guidance for review. |
 | Cursor | `agents_cursor`   | `agents/*.md` → `.cursor/agents/*.md` | Cursor 2.4+ runs subagents natively. `name`/`description`/`model` map; `effort` folds into Cursor's `model[effort=…]`; `background` → `is_background`; `permissionMode: readOnly/plan` → `readonly`. Claude-only fields (`tools`, `hooks`, `memory`, `skills`, …) are dropped with in-file notes. |
 | Cursor | `hooks_cursor`    | `hooks` → `.cursor/hooks.json` | Cursor hooks use camelCase events and a flat shape. Command hooks on shared events translate; matchers, non-command hook types, and Claude-only events are dropped. |
@@ -320,7 +326,7 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-115 tests, stdlib-only. They cover the TOML writer, JSONC stripping,
+124 tests, stdlib-only. They cover the TOML writer, JSONC stripping,
 frontmatter and fenced-block round-trips, MCP normalization (stdio +
 streamable HTTP + opencode local/remote), every Tier A direction across
 all 20 tool pairs, skills tree copies (byte-identical round-trip, the

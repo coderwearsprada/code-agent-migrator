@@ -194,6 +194,78 @@ class FsTestBase(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
+class CodexEffortTiersTests(FsTestBase):
+    """Codex ~0.145 has first-class none/max/ultra tiers above/below the
+    shared scale; Claude tops out at xhigh, pi has off…max."""
+
+    def _codex_to_claude(self, effort):
+        (self.src / "config.toml").write_text(
+            f'model_reasoning_effort = "{effort}"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_codex_to_claude(ctx)
+        p = self.dst / "settings.json"
+        settings = json.loads(p.read_text()) if p.exists() else {}
+        return settings, ctx
+
+    def test_codex_max_and_ultra_collapse_to_xhigh_with_note(self):
+        for effort in ("max", "ultra"):
+            settings, ctx = self._codex_to_claude(effort)
+            self.assertEqual(settings["effortLevel"], "xhigh")
+            self.assertTrue(any("collapsed to xhigh" in n
+                                for n in ctx.report.notes))
+
+    def test_codex_none_effort_reported_not_dropped(self):
+        settings, ctx = self._codex_to_claude("none")
+        self.assertNotIn("effortLevel", settings)
+        self.assertTrue(any("model_reasoning_effort" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_pi_max_and_off_round_trip_with_codex(self):
+        # pi max ↔ codex max and pi off ↔ codex none are 1:1 now.
+        self.assertEqual(m.PI_THINKING_TO_CODEX["max"], "max")
+        self.assertEqual(m.PI_THINKING_TO_CODEX["off"], "none")
+        self.assertEqual(m.CODEX_EFFORT_TO_PI["max"], "max")
+        self.assertEqual(m.CODEX_EFFORT_TO_PI["none"], "off")
+        self.assertEqual(m.CODEX_EFFORT_TO_PI["ultra"], "max")
+
+    def test_codex_ultra_to_pi_max_with_note(self):
+        (self.src / "config.toml").write_text(
+            'model_reasoning_effort = "ultra"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.run_codex_to_pi(ctx, lossy_decisions={})
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(settings["defaultThinkingLevel"], "max")
+        self.assertTrue(any("ultra" in n for n in ctx.report.notes))
+
+    def test_session_end_hook_now_shared_with_codex(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "hooks": {"SessionEnd": [{"hooks": [
+                {"type": "command", "command": "./bye.sh"}]}]},
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_notify_hook(ctx)
+        hooks = json.loads((self.dst / "hooks.json").read_text())["hooks"]
+        self.assertEqual(hooks["SessionEnd"][0]["hooks"][0]["command"],
+                         "./bye.sh")
+
+    def test_protected_allow_prefix_rules_are_warned(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "permissions": {"allow": ["Bash(npm run build:*)",
+                                      "Bash(git status:*)"],
+                            "deny": ["Bash(rm -rf:*)"]},
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_permissions(ctx)
+        # npm is on Codex's protected-prefix list (allow rules get
+        # stripped by its 0.145 one-time migration); git is not, and
+        # protected DENY rules are fine.
+        notes = " ".join(ctx.report.notes)
+        self.assertIn("npm run build", notes)
+        self.assertNotIn("git status", notes)
+        self.assertNotIn("rm -rf", notes)
+
+
+
 class TierASettingsClaudeToCodexTests(FsTestBase):
     def test_all_clean_fields_translate(self):
         (self.src / "settings.json").write_text(json.dumps({
@@ -1082,6 +1154,38 @@ class CursorNativeTargetsTests(FsTestBase):
         self.assertIn("Help with things.", body)
         # readonly has no Claude field — kept as a review note.
         self.assertIn("readonly", body)
+
+
+class CursorModelBracketTests(unittest.TestCase):
+    """Cursor's bracket syntax takes arbitrary id=value params now
+    (effort/context/fast, comma-combined, or empty [] to pin a variant)."""
+
+    def test_effort_extracted_and_extras_reported(self):
+        model_id, effort, extras = m._parse_cursor_model(
+            "claude-opus-5[effort=high,context=300k]")
+        self.assertEqual(model_id, "claude-opus-5")
+        self.assertEqual(effort, "high")
+        self.assertEqual(extras, ["context=300k"])
+
+    def test_empty_brackets_pin_standard_variant(self):
+        model_id, effort, extras = m._parse_cursor_model("composer-2.5[]")
+        self.assertEqual((model_id, effort, extras),
+                         ("composer-2.5", None, []))
+
+    def test_fast_param_flagged_not_silently_dropped(self):
+        agents = self.tmp_src()
+        (agents / "a.md").write_text(
+            "---\ndescription: A\nmodel: composer-2.5[fast=false]\n---\nGo.\n")
+        specs = m._agents_read_cursor(agents.parent)
+        self.assertEqual(specs[0].model, "composer-2.5")
+        self.assertTrue(any("fast=false" in d for d in specs[0].dropped))
+
+    def tmp_src(self):
+        import tempfile
+        root = Path(tempfile.mkdtemp(prefix="migrate-test-")) / "agents"
+        root.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, root.parent, True)
+        return root
 
 
 class CursorHooksTests(FsTestBase):

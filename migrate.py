@@ -247,6 +247,9 @@ CLAUDE_UNMAPPABLE_KEYS = (
     # Newer Claude Code (2.1.15x+) surface with no Codex equivalent.
     "fallbackModel", "availableModels", "defaultMode", "autoMemoryEnabled",
     "attribution", "sandbox", "autoMode",
+    # 2.1.20x additions.
+    "disableAutoMode", "emojiCompletionEnabled", "workflowSizeGuideline",
+    "vimInsertModeRemaps",
 )
 CODEX_UNMAPPABLE_KEYS = (
     "model_provider", "model_providers", "tools", "tui",
@@ -261,8 +264,11 @@ CODEX_UNMAPPABLE_KEYS = (
 
 # Claude `effortLevel` and Codex `model_reasoning_effort` share the
 # low/medium/high/xhigh vocabulary (Claude Code 2.1+; Codex), so those map 1:1.
-# Codex also has `minimal` (→ Claude `low`); Claude's pre-2.1 `max` is the old
-# name for today's `xhigh`, so it maps there too.
+# Codex also has `minimal` (→ Claude `low`) and, since ~0.145, first-class
+# `none`, `max`, and `ultra` tiers. Claude tops out at `xhigh` (its `max`
+# is a legacy *alias* for xhigh, not a higher tier), so Codex max/ultra
+# collapse down to xhigh with a report note, and `none` has no Claude
+# equivalent at all (mapped to nothing; callers report it).
 EFFORT_C2X = {
     "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh",
     "max": "xhigh",  # legacy Claude alias = today's xhigh
@@ -270,7 +276,10 @@ EFFORT_C2X = {
 EFFORT_X2C = {
     "minimal": "low", "low": "low", "medium": "medium", "high": "high",
     "xhigh": "xhigh",
+    "max": "xhigh", "ultra": "xhigh",  # above-xhigh Codex tiers collapse
 }
+# Codex efforts that lose meaning when collapsed into Claude's scale.
+EFFORT_X_DOWNGRADED = ("max", "ultra")
 
 
 # ============================================================================
@@ -429,6 +438,13 @@ def safe_skill_name(name: str, fallback: str = "migrated") -> str:
     return stem or fallback
 
 
+def _fm_bool(value: object) -> bool:
+    """Frontmatter booleans: Claude Code 2.1.218+ accepts yes/no/on/off/1/0
+    alongside true/false (case-insensitive); treat them all as booleans
+    everywhere so migrated files keep their meaning."""
+    return str(value).strip().lower() in ("true", "yes", "on", "1")
+
+
 def _csv_values(value: object) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -457,8 +473,11 @@ def _claude_permission_to_codex_sandbox(mode: str | None) -> str | None:
 def _codex_effort_to_claude(effort: str | None) -> str | None:
     if not effort:
         return None
-    # Claude has no `minimal`; everything else (incl. `xhigh`) is a shared value.
-    return {"minimal": "low"}.get(effort, effort)
+    if effort == "none":
+        return None  # Claude has no effort-off setting
+    # minimal/max/ultra collapse into Claude's low…xhigh scale; any other
+    # value (incl. shared ones and future custom strings) passes through.
+    return EFFORT_X2C.get(effort, effort)
 
 
 _UNSET = object()
@@ -820,6 +839,10 @@ def tier_a_prompts_to_commands(ctx: Ctx) -> None:
             # Prompts migrated by older versions carried description/
             # argument-hint in a migrator:meta comment; still honor it.
             body, fm = meta_comment_to_frontmatter(text)
+        if _SHELL_DEFAULT_RE.search(body):
+            ctx.report.notes.append(
+                f"prompts/{rel}: uses shell-style default substitutions "
+                "(${1:-…}) that only pi expands — review after migrating")
         if fm:
             body = make_frontmatter(fm) + body
         write_text(ctx, dst_dir / rel, body)
@@ -896,18 +919,27 @@ def tier_a_codex_agents_to_claude(ctx: Ctx) -> None:
         ctx.report.migrated_clean.append(f"agents/{f.name} → agents/{name}.md")
 
 
-def _parse_cursor_model(model: str) -> tuple[str, str | None]:
-    """Split Cursor's model bracket syntax — `model-id[effort=high,...]` —
-    into (model_id, effort_or_None). Plain model ids pass through."""
+def _parse_cursor_model(model: str) -> tuple[str, str | None, list[str]]:
+    """Split Cursor's model bracket syntax into (model_id, effort_or_None,
+    other_params). The brackets take comma-separated id=value pairs —
+    `model[effort=high,context=300k,fast=false]` — and empty `[]` pins the
+    standard variant; only `effort` has a cross-tool meaning, so the rest
+    is returned for the caller to flag. Plain model ids pass through."""
     m = re.fullmatch(r"(?P<id>[^\[\]]+)\[(?P<params>[^\]]*)\]", model.strip())
     if not m:
-        return model.strip(), None
+        return model.strip(), None, []
     effort = None
+    extras: list[str] = []
     for part in m.group("params").split(","):
+        part = part.strip()
+        if not part:
+            continue
         k, _, v = part.partition("=")
         if k.strip() == "effort" and v.strip():
             effort = v.strip()
-    return m.group("id").strip(), effort
+        else:
+            extras.append(part)
+    return m.group("id").strip(), effort, extras
 
 
 def tier_a_cursor_agents_to_claude(ctx: Ctx) -> None:
@@ -934,15 +966,20 @@ def tier_a_cursor_agents_to_claude(ctx: Ctx) -> None:
             or f"Imported from Cursor subagent {name}.",
         }
         model = fm.get("model")
+        extras: list[str] = []
         if model and model != "inherit":
-            model_id, effort = _parse_cursor_model(model)
+            model_id, effort, extras = _parse_cursor_model(model)
             out_fm["model"] = model_id
             if effort:
                 out_fm["effort"] = _codex_effort_to_claude(effort) or effort
-        if str(fm.get("is_background", "")).lower() == "true":
+        if _fm_bool(fm.get("is_background", "")):
             out_fm["background"] = "true"
         notes: list[str] = []
-        if str(fm.get("readonly", "")).lower() == "true":
+        if extras:
+            notes.append(
+                "Cursor model bracket params with no Claude equivalent were "
+                "dropped: " + ", ".join(f"`{x}`" for x in extras) + ".")
+        if _fm_bool(fm.get("readonly", "")):
             notes.append(
                 "Cursor readonly=true has no exact Claude subagent field; "
                 "restrict `tools` or use permissions if enforcement is needed.")
@@ -1119,7 +1156,7 @@ def claude_read_rules_as_cursor(ctx: Ctx) -> list[CursorRule]:
                      body, re.DOTALL)
         if m:
             attrs = _parse_comment_meta(m.group("meta"))
-            always = attrs.get("alwaysApply", "false").lower() == "true"
+            always = _fm_bool(attrs.get("alwaysApply", "false"))
             body = body[m.end():]
         paths = fm.get("paths") or fm.get("globs")
         globs: object = paths
@@ -1221,6 +1258,14 @@ def tier_a_settings_codex_to_claude(ctx: Ctx) -> None:
             existing["effortLevel"] = mapped
             ctx.report.migrated_clean.append(
                 f"model_reasoning_effort={eff} → effortLevel={mapped}")
+            if eff in EFFORT_X_DOWNGRADED:
+                ctx.report.notes.append(
+                    f"Codex effort {eff!r} sits above Claude's scale — "
+                    "collapsed to xhigh")
+        else:
+            ctx.report.skipped_unmappable.append(
+                f"model_reasoning_effort={eff!r} (no Claude effortLevel "
+                "equivalent)")
 
     for k in CODEX_UNMAPPABLE_KEYS:
         if k in cfg:
@@ -1311,7 +1356,7 @@ def cursor_read_rules(cursor_root: Path) -> list[CursorRule]:
         for f in sorted(rules_dir.rglob("*.mdc")):
             body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
             fm = fm or {}
-            always = str(fm.get("alwaysApply", "false")).lower() == "true"
+            always = _fm_bool(fm.get("alwaysApply", "false"))
             globs = fm.get("globs")
             # MDC `globs` may be a comma-separated string or a YAML list;
             # we only parsed simple `k: v` lines, so commas stay literal.
@@ -1376,7 +1421,7 @@ def doc_to_cursor_rules(text: str, default_name: str = "migrated") -> list[Curso
             name=safe_cursor_rule_name(m.group("name")),
             description=attrs.get("description", ""),
             globs=globs,
-            always_apply=attrs.get("alwaysApply", "false").lower() == "true",
+            always_apply=_fm_bool(attrs.get("alwaysApply", "false")),
             body=m.group("body").strip(),
         ))
         spans.append((m.start(), m.end()))
@@ -1485,6 +1530,7 @@ OPENCODE_UNMAPPABLE_KEYS = (
     "provider", "plugin", "formatter", "lsp", "share", "autoupdate",
     "snapshot", "compaction", "keybinds", "theme", "tools", "watcher",
     "disabled_providers", "enabled_providers", "experimental", "server",
+    "subagent_depth",  # 1.18.2+: no cross-tool nesting-depth equivalent
 )
 
 
@@ -1739,6 +1785,8 @@ def _claude_perms_to_opencode(perms: dict, report: Report) -> dict:
                 out.setdefault("webfetch", key)
             elif rule.startswith("Read("):
                 out.setdefault("read", key)
+            elif rule.startswith("Skill"):
+                out.setdefault("skill", key)
             else:
                 report.notes.append(
                     f"permissions: {rule} has no opencode permission "
@@ -1805,9 +1853,16 @@ PI_THINKING_TO_CLAUDE = {
     "minimal": "low", "low": "low", "medium": "medium", "high": "high",
     "xhigh": "xhigh", "max": "xhigh",  # pi keeps a max above xhigh; Claude doesn't
 }
+# Codex ~0.145 grew first-class none/max/ultra tiers, so pi's scale now
+# maps 1:1 both ways (off↔none, max↔max); only Codex's `ultra` has no pi
+# name and collapses to max.
 PI_THINKING_TO_CODEX = {
-    "minimal": "minimal", "low": "low", "medium": "medium", "high": "high",
-    "xhigh": "xhigh", "max": "xhigh",
+    "off": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+    "high": "high", "xhigh": "xhigh", "max": "max",
+}
+CODEX_EFFORT_TO_PI = {
+    "none": "off", "minimal": "minimal", "low": "low", "medium": "medium",
+    "high": "high", "xhigh": "xhigh", "max": "max", "ultra": "max",
 }
 
 PI_UNMAPPABLE_SETTINGS = (
@@ -1816,7 +1871,15 @@ PI_UNMAPPABLE_SETTINGS = (
     "followUpMode", "transport", "compaction", "retry", "terminal",
     "images", "shellPath", "shellCommandPrefix", "npmCommand", "sessionDir",
     "httpProxy", "packages", "extensions", "themes",
+    # Resource arrays point at external dirs — copy those separately.
+    "skills", "prompts",
+    "enableSkillCommands", "enableInstallTelemetry", "enableAnalytics",
 )
+
+# pi prompt templates support shell-style default substitutions
+# (`${1:-default}`, `${@:-default}`, `${@:N:L}`) that no other tool
+# expands — flag them when a template leaves pi.
+_SHELL_DEFAULT_RE = re.compile(r"\$\{[^}]*:-|\$\{@")
 
 
 def load_pi_settings(root: Path) -> dict:
@@ -1916,7 +1979,7 @@ def copy_instruction_doc(ctx: Ctx, src_doc: Path, dst_doc: Path,
     ctx.report.migrated_clean.append(f"{src_doc.name} → {dst_doc.name}")
 
 
-def tier_a_prompts_copy(ctx: Ctx) -> None:
+def tier_a_prompts_copy(ctx: Ctx, warn_shell_defaults: bool = True) -> None:
     """Codex prompts ↔ pi prompt templates — the formats are identical
     (description/argument-hint frontmatter, $ARGUMENTS/$1 substitution),
     so files transfer as-is; legacy migrator:meta comments from old
@@ -1930,6 +1993,10 @@ def tier_a_prompts_copy(ctx: Ctx) -> None:
         body, fm = strip_frontmatter(text)
         if fm is None:
             body, fm = meta_comment_to_frontmatter(text)
+        if warn_shell_defaults and _SHELL_DEFAULT_RE.search(body):
+            ctx.report.notes.append(
+                f"prompts/{rel}: uses shell-style default substitutions "
+                "(${1:-…}) that only pi expands — review after migrating")
         out = (make_frontmatter(fm) if fm else "") + body
         write_text(ctx, ctx.dst_root / "prompts" / rel, out)
         ctx.report.migrated_clean.append(f"prompts/{rel} → prompts/{rel}")
@@ -1944,7 +2011,7 @@ def _pi_thinking_out(ctx: Ctx, settings: dict, table: dict) -> str | None:
         ctx.report.skipped_unmappable.append(
             f"settings.json:defaultThinkingLevel={level!r} (no equivalent)")
         return None
-    if level == "max":
+    if level == "max" and mapped != "max":
         ctx.report.notes.append(
             "pi thinking level 'max' sits above 'xhigh'; mapped to the "
             "destination's highest level")
@@ -2033,7 +2100,9 @@ def run_codex_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         ctx, src_doc, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"),
         "AGENTS.md at the project root is read natively by both tools — "
         "no translation needed")
-    tier_a_prompts_copy(ctx)
+    # Destination is pi, which expands every substitution form — no
+    # shell-default warning needed in this direction.
+    tier_a_prompts_copy(ctx, warn_shell_defaults=False)
     tier_a_skills_copy(ctx)
 
     cfg = load_toml(ctx.src_root / "config.toml")
@@ -2045,9 +2114,20 @@ def run_codex_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
             "config.toml:model → defaultProvider/defaultModel")
     effort = cfg.get("model_reasoning_effort")
     if isinstance(effort, str):
-        updates["defaultThinkingLevel"] = effort  # pi accepts Codex's full range
-        ctx.report.migrated_clean.append(
-            f"model_reasoning_effort={effort} → defaultThinkingLevel")
+        mapped = CODEX_EFFORT_TO_PI.get(effort)
+        if mapped:
+            updates["defaultThinkingLevel"] = mapped
+            ctx.report.migrated_clean.append(
+                f"model_reasoning_effort={effort} → defaultThinkingLevel="
+                f"{mapped}")
+            if effort == "ultra":
+                ctx.report.notes.append(
+                    "Codex effort 'ultra' has no pi tier — mapped to pi's "
+                    "highest level 'max'")
+        else:
+            ctx.report.skipped_unmappable.append(
+                f"model_reasoning_effort={effort!r} (no pi thinking-level "
+                "equivalent)")
     if updates:
         pi_update_settings(ctx, updates)
 
@@ -2331,7 +2411,7 @@ def _agents_read_claude(root: Path) -> list[AgentSpec]:
             body=body.strip(),
             model=fm.get("model"), provider=None,
             effort=fm.get("effort"),
-            background=str(fm.get("background", "")).lower() == "true",
+            background=_fm_bool(fm.get("background", "")),
             readonly=fm.get("permissionMode") in ("readOnly", "plan"),
             dropped=sorted(k for k in fm if k not in carried),
         ))
@@ -2376,18 +2456,20 @@ def _agents_read_cursor(root: Path) -> list[AgentSpec]:
             continue
         body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
         fm = fm or {}
-        model_id, effort = (None, None)
+        model_id, effort, extras = (None, None, [])
         if fm.get("model") and fm["model"] != "inherit":
-            model_id, effort = _parse_cursor_model(fm["model"])
+            model_id, effort, extras = _parse_cursor_model(fm["model"])
+        dropped = sorted(k for k in fm if k not in carried)
+        dropped += [f"model param {x!r}" for x in extras]
         specs.append(AgentSpec(
             name=safe_agent_name(fm.get("name") or f.stem),
             description=fm.get("description")
             or f"Imported from Cursor subagent {f.stem}.",
             body=body.strip(),
             model=model_id, effort=effort,
-            background=str(fm.get("is_background", "")).lower() == "true",
-            readonly=str(fm.get("readonly", "")).lower() == "true",
-            dropped=sorted(k for k in fm if k not in carried),
+            background=_fm_bool(fm.get("is_background", "")),
+            readonly=_fm_bool(fm.get("readonly", "")),
+            dropped=dropped,
         ))
     return specs
 
@@ -3087,6 +3169,17 @@ def _parse_prefix_rules(text: str) -> list[tuple[list[str] | None, str]]:
     return out
 
 
+# First tokens whose `allow` prefix rules Codex 0.145+ deletes from
+# rules/default.rules on first launch (one-time protected-prefix
+# migration). Approximation of Codex's list — used only to warn.
+_CODEX_PROTECTED_PREFIXES = frozenset((
+    "sh", "bash", "zsh", "fish", "dash", "env", "eval", "source", "xargs",
+    "python", "python3", "node", "deno", "bun", "ruby", "perl",
+    "npx", "npm", "pnpm", "yarn", "uv", "uvx", "pip", "pip3",
+    "rm", "sudo", "chmod", "chown", "dd", "mkfs", "kill", "killall",
+))
+
+
 def _emit_codex_prefix_rules(ctx: Ctx, perms: dict) -> None:
     """Claude Bash() permission rules → Codex rules/default.rules.
 
@@ -3097,6 +3190,7 @@ def _emit_codex_prefix_rules(ctx: Ctx, perms: dict) -> None:
     existing = dst.read_text(encoding="utf-8") if dst.exists() else ""
     lines: list[str] = []
     skipped: list[str] = []
+    protected: list[str] = []
     for key, decision in _RULE_DECISION_C2X.items():
         for rule in perms.get(key) or []:
             if not str(rule).startswith("Bash"):
@@ -3105,9 +3199,17 @@ def _emit_codex_prefix_rules(ctx: Ctx, perms: dict) -> None:
             if tokens is None:
                 skipped.append(str(rule))
                 continue
+            if decision == "allow" and tokens[0] in _CODEX_PROTECTED_PREFIXES:
+                protected.append(shlex.join(tokens))
             rendered = _render_prefix_rule(tokens, decision)
             if rendered not in existing and rendered not in lines:
                 lines.append(rendered)
+    if protected:
+        ctx.report.notes.append(
+            "Codex 0.145+ strips allow rules for protected commands "
+            "(shells, interpreters, package runners, destructive tools) on "
+            "first launch — these may not survive: "
+            + ", ".join(sorted(set(protected))))
     if lines:
         body = existing.rstrip() + "\n" if existing.strip() else ""
         write_text(ctx, dst, body + "\n".join(lines) + "\n")
@@ -3294,6 +3396,7 @@ HOOK_EVENTS_SHARED_CODEX = (
     "SessionStart", "SubagentStart", "UserPromptSubmit", "PreToolUse",
     "PermissionRequest", "PostToolUse", "PreCompact", "PostCompact",
     "SubagentStop", "Stop",
+    "SessionEnd",  # Codex 0.145+ (1s default timeout there — keep hooks fast)
 )
 
 
@@ -3694,7 +3797,7 @@ def _apply_claude_agents_cursor(ctx: Ctx) -> None:
             out_fm["model"] = f"{model}[effort={effort}]"
         elif model:
             out_fm["model"] = model
-        if str(fm.get("background", "")).lower() == "true":
+        if _fm_bool(fm.get("background", "")):
             out_fm["is_background"] = "true"
         if fm.get("permissionMode") in ("readOnly", "plan"):
             out_fm["readonly"] = "true"
