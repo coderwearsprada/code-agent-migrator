@@ -1246,7 +1246,9 @@ def tier_a_settings_codex_to_claude(ctx: Ctx) -> None:
         existing["env"].update({k: str(v) for k, v in set_vars.items()})
         ctx.report.migrated_clean.append(
             f"[shell_environment_policy] set ({len(set_vars)} vars) → settings.json:env")
-    for k in ("include_only", "exclude", "inherit"):
+    # `filters` is the 0.146+ keyed form of include_only/exclude (which are
+    # now legacy); none of them has a Claude Code equivalent.
+    for k in ("include_only", "exclude", "inherit", "filters"):
         if k in sep:
             ctx.report.skipped_unmappable.append(
                 f"shell_environment_policy.{k} (no Claude Code equivalent)")

@@ -220,6 +220,19 @@ class CodexEffortTiersTests(FsTestBase):
         self.assertTrue(any("model_reasoning_effort" in s
                             for s in ctx.report.skipped_unmappable))
 
+    def test_env_filters_reported_not_silently_ignored(self):
+        # Codex 0.146+ keyed filters form; the migrator carries only `set`.
+        (self.src / "config.toml").write_text(
+            '[shell_environment_policy]\n'
+            'set = { KEY = "v" }\n'
+            'filters = { "AWS_*" = "exclude" }\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_codex_to_claude(ctx)
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(settings["env"], {"KEY": "v"})
+        self.assertTrue(any("filters" in s
+                            for s in ctx.report.skipped_unmappable))
+
     def test_pi_max_and_off_round_trip_with_codex(self):
         # pi max ↔ codex max and pi off ↔ codex none are 1:1 now.
         self.assertEqual(m.PI_THINKING_TO_CODEX["max"], "max")

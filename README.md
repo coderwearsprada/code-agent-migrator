@@ -13,10 +13,9 @@ Requires Python 3.9+. No third-party dependencies. On 3.11+ it uses the
 stdlib `tomllib`; on 3.9/3.10 it falls back to a small bundled TOML reader
 covering the subset Codex's `config.toml` uses.
 
-**Tested against:** Claude Code `2.1.207` (schemas cross-checked with the
-2.1.220 docs), Codex CLI `0.137.0` (schemas cross-checked with the 0.145
-docs and source), Cursor 3.x schemas, opencode 1.18.x schemas, and pi
-0.82.x docs, all as of 2026-07-28. The script reads documented config schemas, so minor version bumps
+**Tested against:** Claude Code `2.1.220`, Codex CLI `0.137.0` (schemas
+cross-checked with the 0.146 docs and source), Cursor 3.x schemas,
+opencode 1.18.x schemas, and pi 0.83.x docs, all as of 2026-07-31. The script reads documented config schemas, so minor version bumps
 should keep working; if a future release renames or removes a key, the
 migrator will flag it as "not translated" in the report rather than corrupt
 your config.
@@ -248,7 +247,8 @@ Listed in `MIGRATION_REPORT.md` so you know to recreate them by hand:
   `permissions` (Cursor's CLI has its own allow/deny rule files —
   `~/.cursor/cli-config.json` / `.cursor/cli.json` — rebuild by hand),
   `effortLevel`, `env`, `outputStyle`.
-- **Codex-only:** `model_provider(s)`, `web_search`, `features`,
+- **Codex-only:** `model_provider(s)`, `shell_environment_policy`
+  filters/include_only/exclude (only `set` maps), `web_search`, `features`,
   `default_permissions` / named `[permissions.*]` profiles,
   `disable_response_storage` / history persistence, `tui` settings,
   `hide_agent_reasoning`, `project_doc_max_bytes`,
