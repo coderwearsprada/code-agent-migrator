@@ -66,10 +66,11 @@ from typing import Any, Callable, Iterable
 # Python 3.11+ ships `tomllib` in the stdlib. On 3.9/3.10 we fall back to a
 # small hand-rolled parser covering the subset Codex's `config.toml` uses:
 # top-level scalars (strings, bools, ints, floats), `[table]` and
-# `[table.sub]` headers, arrays of scalars, inline `{ k = v, ... }` tables,
-# and `# ...` comments. Anything more exotic (multi-line strings, dates,
-# `[[arrays.of.tables]]`, dotted keys, hex/octal numbers) is unsupported —
-# the migrator doesn't need any of it.
+# `[table.sub]` headers, `[[arrays.of.tables]]` (the natural way to write
+# an inline `[hooks]` table), arrays of scalars, inline `{ k = v, ... }`
+# tables, and `# ...` comments. Anything more exotic (multi-line strings,
+# dates, dotted keys, hex/octal numbers) is unsupported — the migrator
+# doesn't need any of it.
 
 try:
     import tomllib  # type: ignore[import-not-found]  # Python 3.11+
@@ -200,15 +201,32 @@ except ModuleNotFoundError:
             if not line:
                 continue
             if line.startswith("["):
-                end = line.find("]")
+                is_array = line.startswith("[[")
+                close = "]]" if is_array else "]"
+                end = line.find(close)
                 if end < 0:
                     raise err(f"unterminated section header: {line!r}")
-                path = [p.strip() for p in line[1:end].split(".")]
+                path = [p.strip()
+                        for p in line[(2 if is_array else 1):end].split(".")]
                 current = root
-                for p in path:
+                for idx, p in enumerate(path):
                     if p.startswith('"') and p.endswith('"') and len(p) >= 2:
                         p = p[1:-1]
-                    current = current.setdefault(p, {})
+                    if is_array and idx == len(path) - 1:
+                        arr = current.setdefault(p, [])
+                        if not isinstance(arr, list):
+                            raise err(f"{p!r} is not an array of tables")
+                        arr.append({})
+                        current = arr[-1]
+                        continue
+                    nxt = current.setdefault(p, {})
+                    # A path segment naming an array of tables refers to
+                    # its most recent element (TOML semantics).
+                    if isinstance(nxt, list):
+                        if not nxt:
+                            nxt.append({})
+                        nxt = nxt[-1]
+                    current = nxt
                 continue
             eq = line.find("=")
             if eq < 0:
@@ -250,6 +268,15 @@ CLAUDE_UNMAPPABLE_KEYS = (
     # 2.1.20x additions.
     "disableAutoMode", "emojiCompletionEnabled", "workflowSizeGuideline",
     "vimInsertModeRemaps",
+    # 2.1.22x–2.1.27x additions (settings reference as of 2026-09-14).
+    "maxEffortLevel", "modelSettings", "modelOverrides", "advisorModel",
+    "fastMode", "language", "timeFormat", "timeZone", "defaultShell",
+    "editorMode", "bashOutputMaxChars", "taskOutputMaxChars",
+    "autoCompactEnabled", "claudeMdExcludes", "plansDirectory",
+    "includeCoAuthoredBy", "includeGitInstructions", "respectGitignore",
+    "enabledPlugins", "extraKnownMarketplaces", "pluginConfigs",
+    "skillOverrides", "cleanupPeriodDays", "apiKeyHelper",
+    "forceLoginMethod", "teammateMode", "worktree", "agent",
 )
 CODEX_UNMAPPABLE_KEYS = (
     "model_provider", "model_providers", "tools", "tui",
@@ -260,6 +287,12 @@ CODEX_UNMAPPABLE_KEYS = (
     "web_search", "features", "default_permissions", "permissions",
     "agents", "memories", "apps", "plugins", "service_tier",
     "project_doc_fallback_filenames",
+    # 0.147–0.154 surface (config reference as of 2026-09-14).
+    "model_instructions_file", "plan_mode_reasoning_effort", "personality",
+    "review_model", "approvals_reviewer", "auto_review", "skills",
+    "tool_suggest", "tool_output_token_limit", "computer_use",
+    "browser_use", "otel", "marketplaces", "projects",
+    "project_root_markers", "compact_prompt",
 )
 
 # Claude `effortLevel` and Codex `model_reasoning_effort` share the
@@ -268,7 +301,9 @@ CODEX_UNMAPPABLE_KEYS = (
 # `none`, `max`, and `ultra` tiers. Claude tops out at `xhigh` (its `max`
 # is a legacy *alias* for xhigh, not a higher tier), so Codex max/ultra
 # collapse down to xhigh with a report note, and `none` has no Claude
-# equivalent at all (mapped to nothing; callers report it).
+# equivalent at all (mapped to nothing; callers report it). Codex 0.154
+# also carries an internal `persistent` marker and model-defined custom
+# strings; anything outside these tables falls through as untranslatable.
 EFFORT_C2X = {
     "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh",
     "max": "xhigh",  # legacy Claude alias = today's xhigh
@@ -465,7 +500,8 @@ def _claude_permission_to_codex_sandbox(mode: str | None) -> str | None:
     if not mode:
         return None
     return {
-        "readOnly": "read-only",
+        "readOnly": "read-only",  # pre-2.1 spelling, kept for old files
+        "plan": "read-only",
         "acceptEdits": "workspace-write",
     }.get(mode)
 
@@ -764,9 +800,11 @@ def tier_a_docs_claude_to_codex(ctx: Ctx) -> None:
         ctx.report.migrated_clean.append(f"{src.name} → {dst.name}")
 
 
-def tier_a_docs_codex_to_claude(ctx: Ctx) -> None:
-    """AGENTS.md → CLAUDE.md, plus config.toml:instructions appended fenced."""
-    src = ctx.src_doc or (ctx.src_root / "AGENTS.md")
+def tier_a_docs_codex_to_claude(ctx: Ctx, src: Path | None = None) -> None:
+    """AGENTS.md → CLAUDE.md, plus config.toml developer_instructions (or
+    legacy instructions) appended fenced. `src` overrides the doc to read
+    (pi's AGENTS.override.md shadows AGENTS.md, for example)."""
+    src = src or ctx.src_doc or (ctx.src_root / "AGENTS.md")
     if not src.exists():
         src = ctx.src_root / "AGENTS.md"
     dst = ctx.dst_doc or (ctx.dst_root / "CLAUDE.md")
@@ -781,11 +819,14 @@ def tier_a_docs_codex_to_claude(ctx: Ctx) -> None:
             content_parts.append(src.read_text(encoding="utf-8").rstrip() + "\n")
 
     cfg = load_toml(ctx.src_root / "config.toml")
-    if "instructions" in cfg and isinstance(cfg["instructions"], str):
-        content_parts.append(fenced_block(
-            "instructions", "config.toml", cfg["instructions"]))
-        ctx.report.migrated_clean.append(
-            "config.toml:instructions → fenced block in CLAUDE.md")
+    # `developer_instructions` is the live key (Codex 0.15x injects it into
+    # the session); `instructions` is reserved/ignored by current Codex but
+    # older configs still carry it, so both are unwrapped into CLAUDE.md.
+    for key in ("developer_instructions", "instructions"):
+        if isinstance(cfg.get(key), str) and cfg[key].strip():
+            content_parts.append(fenced_block(key, "config.toml", cfg[key]))
+            ctx.report.migrated_clean.append(
+                f"config.toml:{key} → fenced block in CLAUDE.md")
 
     if not content_parts:
         return
@@ -1465,20 +1506,101 @@ def cursor_write_rules(rules: list[CursorRule], cursor_root: Path,
         write_text(ctx, rules_dir / f"{safe_cursor_rule_name(r.name)}.mdc", body)
 
 
-def cursor_cli_config_write_model(ctx: Ctx, model: str) -> None:
-    """Carry the default model into Cursor's CLI config
-    (<cursor_root>/cli-config.json, `version: 1`). Model ids aren't
-    renamed — fix the id by hand if the destination doesn't know it."""
+# Cursor CLI 2026.09.x validates cli-config.json against a schema on load
+# and, on failure, renames the file to `.bad` and regenerates defaults —
+# taking the user's permission allowlist with it. `model` is a
+# ModelDetails object there (older CLIs stored a bare string), the explicit
+# pick lives in `selectedModel`, per-model parameters (effort/fast/context)
+# sit in `modelParameters`, and `hasChangedDefaultModel` must be true or
+# the CLI treats the model as the unchanged server default and overwrites
+# it on the next launch.
+CURSOR_EFFORT_VALUES = ("low", "medium", "high")
+
+
+def _cursor_model_details(model_id: str) -> dict:
+    return {
+        "modelId": model_id, "displayModelId": model_id,
+        "displayName": model_id, "displayNameShort": model_id,
+        "aliases": [model_id],
+    }
+
+
+def cursor_cli_config_write_model(ctx: Ctx, model: str,
+                                  effort: str | None = None) -> None:
+    """Carry the default model (and, when given, a reasoning effort) into
+    Cursor's CLI config (<cursor_root>/cli-config.json, `version: 1`).
+    Model ids aren't renamed — fix the id by hand if the destination
+    doesn't know it; the CLI falls back to its default for unknown ids."""
     p = ctx.dst_root / "cli-config.json"
     existing = load_json(p) if (ctx.merge and p.exists()) else {}
     existing.setdefault("version", 1)
-    existing["model"] = model
+    existing["model"] = _cursor_model_details(model)
+    params: list[dict] = []
+    if effort:
+        params.append({"id": "effort", "value": effort})
+    existing["selectedModel"] = {"modelId": model, "parameters": params}
+    if effort:
+        existing.setdefault("modelParameters", {})[model] = params
+    existing["hasChangedDefaultModel"] = True
     write_text(ctx, p, json.dumps(existing, indent=2) + "\n")
 
 
 def cursor_cli_config_read_model(cursor_root: Path) -> str | None:
-    model = load_json(cursor_root / "cli-config.json").get("model")
+    cfg = load_json(cursor_root / "cli-config.json")
+    selected = cfg.get("selectedModel")
+    if isinstance(selected, dict) and isinstance(selected.get("modelId"), str):
+        if selected["modelId"]:
+            return selected["modelId"]
+    model = cfg.get("model")
+    if isinstance(model, dict):
+        model = model.get("modelId")
     return model if isinstance(model, str) and model else None
+
+
+def cursor_cli_config_read_effort(cursor_root: Path) -> str | None:
+    """The `effort` entry of the selected model's parameters — Cursor's
+    equivalent of a global reasoning-effort knob — if any."""
+    cfg = load_json(cursor_root / "cli-config.json")
+    model_id = cursor_cli_config_read_model(cursor_root)
+    selected = cfg.get("selectedModel")
+    params = selected.get("parameters") if isinstance(selected, dict) else None
+    if not params and model_id:
+        saved = cfg.get("modelParameters")
+        params = saved.get(model_id) if isinstance(saved, dict) else None
+    for prm in params or []:
+        if isinstance(prm, dict) and prm.get("id") == "effort":
+            v = prm.get("value")
+            return v if isinstance(v, str) and v else None
+    return None
+
+
+def cursor_effort_from(ctx: Ctx, effort: str, source: str) -> str | None:
+    """Fold a low…max-style effort into the values Cursor's model
+    parameters accept (low/medium/high): higher tiers collapse to high
+    with a note, lower ones (none/minimal/off) are reported."""
+    if effort in CURSOR_EFFORT_VALUES:
+        return effort
+    if effort in ("xhigh", "max", "ultra"):
+        ctx.report.notes.append(
+            f"{source}={effort}: Cursor model parameters top out at "
+            "'high' — collapsed")
+        return "high"
+    ctx.report.skipped_unmappable.append(
+        f"{source}={effort!r} (no Cursor effort parameter equivalent)")
+    return None
+
+
+def _cursor_native_dirs_note(ctx: Ctx, src_dot: str,
+                             subdirs: tuple[str, ...]) -> None:
+    """Cursor reads .claude/{skills,agents}, .codex/{skills,agents} and
+    .agents/skills in place (user and project scope), so those copies are
+    for self-containment, not necessity — say so once."""
+    present = [d for d in subdirs if (ctx.src_root / d).is_dir()
+               and any((ctx.src_root / d).iterdir())]
+    if present:
+        ctx.report.notes.append(
+            f"Cursor also reads {src_dot}/{{{','.join(present)}}} in place "
+            "(user + project scope) — the copies make .cursor self-contained")
 
 
 def _cursor_label_mcp(direction: str, mcp: dict) -> str:
@@ -1533,6 +1655,9 @@ OPENCODE_UNMAPPABLE_KEYS = (
     "snapshot", "compaction", "keybinds", "theme", "tools", "watcher",
     "disabled_providers", "enabled_providers", "experimental", "server",
     "subagent_depth",  # 1.18.2+: no cross-tool nesting-depth equivalent
+    # TUI/shell knobs and the default-agent pick (docs as of 1.18.31).
+    "tui", "default_agent", "shell", "attachment", "attention",
+    "diff_style", "mouse", "cursor", "scroll_speed", "scroll_acceleration",
 )
 
 
@@ -1842,8 +1967,10 @@ def _opencode_perms_to_claude(permission: dict, report: Report) -> dict:
 # ============================================================================
 # pi (pi.dev, earendil-works/pi) keeps user config in ~/.pi/agent/ and
 # project config in .pi/. It reads AGENTS.md *or* CLAUDE.md natively
-# (global + walking up from cwd), speaks the Agent Skills standard
-# (skills/<name>/SKILL.md, plus bare skills/*.md files), and its prompt
+# (global + walking up from cwd; an AGENTS.override.md in the same dir
+# replaces both since 0.84), speaks the Agent Skills standard
+# (skills/<name>/SKILL.md, plus bare skills/*.md files that carry a
+# description in their frontmatter), and its prompt
 # templates (prompts/*.md, description/argument-hint frontmatter,
 # $ARGUMENTS substitution) are format-identical to Codex custom prompts.
 # settings.json carries defaultProvider/defaultModel/defaultThinkingLevel.
@@ -1876,6 +2003,10 @@ PI_UNMAPPABLE_SETTINGS = (
     # Resource arrays point at external dirs — copy those separately.
     "skills", "prompts",
     "enableSkillCommands", "enableInstallTelemetry", "enableAnalytics",
+    # 0.84–0.85 additions (settings reference as of 2026-09-14).
+    "defaultTools", "tuiMode", "fullscreenExitOutput", "fullscreenScrollbar",
+    "fullscreenCopyOnSelect", "markdown", "branchSummary",
+    "showCacheMissNotices", "treeFilterMode", "warnings",
 )
 
 # pi prompt templates support shell-style default substitutions
@@ -1886,6 +2017,36 @@ _SHELL_DEFAULT_RE = re.compile(r"\$\{[^}]*:-|\$\{@")
 
 def load_pi_settings(root: Path) -> dict:
     return load_json(root / "settings.json")
+
+
+def pi_context_doc(directory: Path) -> Path:
+    """pi 0.84+ loads AGENTS.override.md *instead of* AGENTS.md/CLAUDE.md
+    when both sit in the same directory, so that's the file to migrate."""
+    override = directory / "AGENTS.override.md"
+    return override if override.exists() else directory / "AGENTS.md"
+
+
+def _pi_src_doc(ctx: Ctx) -> Path:
+    """The instruction file pi actually loads on the source side: the
+    project doc location first, then the pi root."""
+    bases = ([ctx.src_doc.parent] if ctx.src_doc else []) + [ctx.src_root]
+    for base in bases:
+        doc = pi_context_doc(base)
+        if doc.exists():
+            if doc.name == "AGENTS.override.md":
+                ctx.report.notes.append(
+                    f"{doc.name} shadows AGENTS.md for pi — migrated the "
+                    "override's content")
+            return doc
+    return ctx.src_root / "AGENTS.md"
+
+
+def _pi_note_override_shadow(ctx: Ctx, dst_doc: Path) -> None:
+    override = dst_doc.parent / "AGENTS.override.md"
+    if override.exists():
+        ctx.report.notes.append(
+            f"{override.name} exists next to {dst_doc.name} — pi loads the "
+            "override instead, so fold the migrated content in by hand")
 
 
 def pi_update_settings(ctx: Ctx, updates: dict) -> None:
@@ -1932,9 +2093,11 @@ def _pi_feature_gap_notes(ctx: Ctx, mcp: bool = False, agents: bool = False,
 
 def skills_from_pi(ctx: Ctx) -> None:
     """Skills out of pi: standard skill dirs copy verbatim; pi also treats
-    bare skills/*.md files as skills — those become <name>/SKILL.md dirs
-    (the only layout the other tools read), synthesizing name/description
-    frontmatter when the bare file lacks it."""
+    bare skills/*.md files as skills *when they carry skill frontmatter
+    with a non-empty description* (0.84.2+; undecorated README-style files
+    are ignored). Qualifying files become <name>/SKILL.md dirs (the only
+    layout the other tools read), synthesizing `name` from the filename
+    when the frontmatter lacks it."""
     tier_a_skills_copy(ctx)
     skills_root = ctx.src_root / "skills"
     if not skills_root.is_dir():
@@ -1943,22 +2106,23 @@ def skills_from_pi(ctx: Ctx) -> None:
         text = f.read_text(encoding="utf-8")
         body, fm = strip_frontmatter(text)
         fm = fm or {}
+        description = str(fm.get("description") or "").strip()
+        if not description:
+            ctx.report.notes.append(
+                f"skills/{f.name}: no skill frontmatter with a description "
+                "— pi ignores such root files, so it was not migrated")
+            continue
         name = safe_skill_name(fm.get("name") or f.stem)
-        if fm.get("name") and fm.get("description"):
+        if fm.get("name"):
             content = text
         else:
-            merged = dict(fm)
-            merged["name"] = name
-            merged.setdefault(
-                "description",
-                _first_heading(body) or f"Migrated pi skill {name}")
             # name/description lead; any other keys keep their values.
-            ordered = {"name": merged.pop("name"),
-                       "description": merged.pop("description"), **merged}
-            content = make_frontmatter(ordered) + body.lstrip("\n")
+            merged = {"name": name, "description": description,
+                      **{k: v for k, v in fm.items() if k != "description"}}
+            content = make_frontmatter(merged) + body.lstrip("\n")
             ctx.report.notes.append(
-                f"skills/{f.name}: synthesized missing name/description "
-                "frontmatter for the SKILL.md standard")
+                f"skills/{f.name}: synthesized missing name frontmatter "
+                "for the SKILL.md standard")
         write_text(ctx, ctx.dst_root / "skills" / name / "SKILL.md", content)
         ctx.report.migrated_clean.append(
             f"skills/{f.name} → skills/{name}/SKILL.md (bare pi skill file)")
@@ -2004,9 +2168,32 @@ def tier_a_prompts_copy(ctx: Ctx, warn_shell_defaults: bool = True) -> None:
         ctx.report.migrated_clean.append(f"prompts/{rel} → prompts/{rel}")
 
 
-def _pi_thinking_out(ctx: Ctx, settings: dict, table: dict) -> str | None:
+def _pi_effective_thinking_level(ctx: Ctx, settings: dict) -> str | None:
+    """pi 0.84.3+ keeps per-model startup levels in `modelThinkingLevels`
+    (keyed "provider/modelId") that override `defaultThinkingLevel` for
+    the startup model — mirror that resolution, and report entries for
+    other models since no destination has a per-model effort knob."""
+    per_model = settings.get("modelThinkingLevels")
+    per_model = per_model if isinstance(per_model, dict) else {}
+    provider, model = settings.get("defaultProvider"), settings.get("defaultModel")
+    key = f"{provider}/{model}" if provider and model else None
     level = settings.get("defaultThinkingLevel")
-    if not isinstance(level, str):
+    if key and isinstance(per_model.get(key), str):
+        level = per_model[key]
+        ctx.report.notes.append(
+            f"modelThinkingLevels[{key}]={level} overrides "
+            "defaultThinkingLevel for the startup model")
+    others = sorted(k for k in per_model if k != key)
+    if others:
+        ctx.report.skipped_unmappable.append(
+            "settings.json:modelThinkingLevels for "
+            f"{', '.join(others)} (no per-model effort on the destination)")
+    return level if isinstance(level, str) else None
+
+
+def _pi_thinking_out(ctx: Ctx, settings: dict, table: dict) -> str | None:
+    level = _pi_effective_thinking_level(ctx, settings)
+    if level is None:
         return None
     mapped = table.get(level)
     if mapped is None:
@@ -2024,6 +2211,7 @@ def _pi_thinking_out(ctx: Ctx, settings: dict, table: dict) -> str | None:
 
 def run_claude_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     tier_a_docs_claude_to_codex(ctx)  # CLAUDE.md (+rules/outputStyle) → AGENTS.md
+    _pi_note_override_shadow(ctx, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"))
     ctx.report.notes.append(
         "pi also reads CLAUDE.md natively — the AGENTS.md copy makes the "
         "config self-contained")
@@ -2064,7 +2252,8 @@ def run_claude_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
 
 
 def run_pi_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
-    tier_a_docs_codex_to_claude(ctx)  # AGENTS.md → CLAUDE.md (@import at project)
+    # AGENTS[.override].md → CLAUDE.md (@import at project scope)
+    tier_a_docs_codex_to_claude(ctx, src=_pi_src_doc(ctx))
     tier_a_prompts_to_commands(ctx)
     skills_from_pi(ctx)
 
@@ -2102,6 +2291,7 @@ def run_codex_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         ctx, src_doc, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"),
         "AGENTS.md at the project root is read natively by both tools — "
         "no translation needed")
+    _pi_note_override_shadow(ctx, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"))
     # Destination is pi, which expands every substitution form — no
     # shell-default warning needed in this direction.
     tier_a_prompts_copy(ctx, warn_shell_defaults=False)
@@ -2138,8 +2328,7 @@ def run_codex_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         mcp=bool(cfg.get("mcp_servers")),
         agents=(ctx.src_root / "agents").is_dir()
         and any((ctx.src_root / "agents").glob("*.toml")),
-        hooks=bool(cfg.get("notify")
-                   or load_json(ctx.src_root / "hooks.json").get("hooks")),
+        hooks=bool(cfg.get("notify") or codex_read_hooks(ctx.src_root)),
         permissions=(ctx.src_root / "rules").is_dir()
         or any(k in cfg for k in ("sandbox_mode", "approval_policy")),
     )
@@ -2148,9 +2337,7 @@ def run_codex_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
 
 
 def run_pi_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
-    src_doc = ctx.src_root / "AGENTS.md"
-    if ctx.src_doc and ctx.src_doc.exists():
-        src_doc = ctx.src_doc
+    src_doc = _pi_src_doc(ctx)
     copy_instruction_doc(
         ctx, src_doc, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"),
         "AGENTS.md at the project root is read natively by both tools — "
@@ -2195,12 +2382,19 @@ def run_cursor_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         ctx.report.migrated_clean.append(
             f"{len(rules)} cursor rule(s) → {dst_doc.name}")
     tier_a_skills_copy(ctx)
+    _pi_note_override_shadow(ctx, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"))
 
     model = cursor_cli_config_read_model(ctx.src_root)
     if model:
-        pi_update_settings(ctx, {"defaultModel": model})
+        updates: dict = {"defaultModel": model}
+        effort = cursor_cli_config_read_effort(ctx.src_root)
+        if effort in CURSOR_EFFORT_VALUES:
+            updates["defaultThinkingLevel"] = effort
+        pi_update_settings(ctx, updates)
         ctx.report.migrated_clean.append(
-            "cli-config.json:model → defaultModel")
+            "cli-config.json:model → defaultModel"
+            + (f" (effort={effort} → defaultThinkingLevel)"
+               if "defaultThinkingLevel" in updates else ""))
         ctx.report.notes.append(
             "defaultProvider was not set (Cursor doesn't record one) — "
             "set it in ~/.pi/agent/settings.json if needed")
@@ -2216,9 +2410,7 @@ def run_cursor_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
 
 
 def run_pi_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
-    src_doc = ctx.src_root / "AGENTS.md"
-    if ctx.src_doc and ctx.src_doc.exists():
-        src_doc = ctx.src_doc
+    src_doc = _pi_src_doc(ctx)
     project_dst = cursor_project_root_from(ctx.dst_root)
     if (project_dst and src_doc.exists()
             and src_doc == project_dst / "AGENTS.md"):
@@ -2235,10 +2427,19 @@ def run_pi_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     skills_from_pi(ctx)
 
     settings = load_pi_settings(ctx.src_root)
+    level = _pi_effective_thinking_level(ctx, settings)
     if isinstance(settings.get("defaultModel"), str):
-        cursor_cli_config_write_model(ctx, settings["defaultModel"])
+        effort = (cursor_effort_from(
+            ctx, level, "settings.json:defaultThinkingLevel")
+            if level else None)
+        cursor_cli_config_write_model(ctx, settings["defaultModel"], effort)
         ctx.report.migrated_clean.append(
-            "defaultModel → cli-config.json:model")
+            "defaultModel → cli-config.json:model"
+            + (f" (effort={effort})" if effort else ""))
+    elif level:
+        ctx.report.skipped_unmappable.append(
+            "settings.json:defaultThinkingLevel (Cursor stores effort per "
+            "model — set defaultModel too)")
     pi_report_unmappables(ctx, settings)
 
     _run_lossy(ctx, lossy_decisions, "pi->cursor")
@@ -2253,6 +2454,7 @@ def run_opencode_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         ctx, src_doc, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"),
         "AGENTS.md at the project root is read natively by both tools — "
         "no translation needed")
+    _pi_note_override_shadow(ctx, ctx.dst_doc or (ctx.dst_root / "AGENTS.md"))
     tier_a_opencode_commands_to(ctx, "prompts")
     _skills_copy_from_opencode(ctx)
 
@@ -2277,9 +2479,7 @@ def run_opencode_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
 
 
 def run_pi_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
-    src_doc = ctx.src_root / "AGENTS.md"
-    if ctx.src_doc and ctx.src_doc.exists():
-        src_doc = ctx.src_doc
+    src_doc = _pi_src_doc(ctx)
     opencode_docs_note_or_copy(ctx, src_doc)
     tier_a_commands_to_opencode(ctx, "prompts")
     skills_from_pi(ctx)
@@ -2296,10 +2496,10 @@ def run_pi_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
             ctx.report.notes.append(
                 "opencode model ids are provider-qualified — check "
                 f"`{settings['defaultModel']}` resolves")
-    if settings.get("defaultThinkingLevel"):
+    if settings.get("defaultThinkingLevel") or settings.get("modelThinkingLevels"):
         ctx.report.skipped_unmappable.append(
-            "settings.json:defaultThinkingLevel (opencode has no "
-            "reasoning-effort knob)")
+            "settings.json:defaultThinkingLevel/modelThinkingLevels "
+            "(opencode has no reasoning-effort knob)")
     pi_report_unmappables(ctx, settings)
 
     _run_lossy(ctx, lossy_decisions, "pi->opencode")
@@ -2805,6 +3005,10 @@ def run_cursor_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
             ctx, {"model": model_to_opencode(model, "cursor")})
         ctx.report.migrated_clean.append(
             "cli-config.json:model → opencode.json:model")
+        if cursor_cli_config_read_effort(ctx.src_root):
+            ctx.report.skipped_unmappable.append(
+                "cli-config.json model effort (opencode has no "
+                "reasoning-effort knob)")
         if "/" not in model:
             ctx.report.notes.append(
                 f"opencode model ids are provider-qualified — check "
@@ -2882,17 +3086,30 @@ def run_claude_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     # deprecated .cursor/commands in favor of slash-invocable skills).
     tier_a_skills_copy(ctx)
     tier_a_commands_to_cursor_skills(ctx, "commands", "commands")
+    _cursor_native_dirs_note(ctx, ".claude", ("skills", "agents"))
 
-    # Tier A: default model → Cursor CLI config.
+    # Tier A: default model (+ effort as a Cursor model parameter) → CLI
+    # config. Effort only lives on a model there, so it needs one.
+    effort_level = settings.get("effortLevel")
     if isinstance(settings.get("model"), str):
-        cursor_cli_config_write_model(ctx, settings["model"])
+        effort = None
+        if isinstance(effort_level, str):
+            effort = cursor_effort_from(
+                ctx, EFFORT_C2X.get(effort_level, effort_level),
+                "settings.json:effortLevel")
+        cursor_cli_config_write_model(ctx, settings["model"], effort)
         ctx.report.migrated_clean.append(
-            "settings.json:model → cli-config.json:model")
+            "settings.json:model → cli-config.json:model"
+            + (f" (effort={effort})" if effort else ""))
+    elif effort_level:
+        ctx.report.skipped_unmappable.append(
+            "settings.json:effortLevel (Cursor stores effort per model — "
+            "set settings.json:model too)")
 
     # Settings keys with no Cursor equivalent (truly Tier C). Hooks have a
     # Tier B option below; permissions have a partial Cursor CLI analog
     # the user has to build by hand.
-    for key in ("effortLevel", "env"):
+    for key in ("env",):
         if settings.get(key):
             ctx.report.skipped_unmappable.append(
                 f"settings.json:{key} (Cursor has no equivalent)")
@@ -2944,9 +3161,18 @@ def run_cursor_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         dst = ctx.dst_root / "settings.json"
         existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
         existing["model"] = model
-        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
         ctx.report.migrated_clean.append(
             "cli-config.json:model → settings.json:model")
+        effort = cursor_cli_config_read_effort(ctx.src_root)
+        if effort in CURSOR_EFFORT_VALUES:
+            existing["effortLevel"] = effort
+            ctx.report.migrated_clean.append(
+                f"cli-config.json effort={effort} → settings.json:effortLevel")
+        elif effort:
+            ctx.report.skipped_unmappable.append(
+                f"cli-config.json effort={effort!r} (no Claude effortLevel "
+                "equivalent)")
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
 
     _run_lossy(ctx, lossy_decisions, "cursor->claude")
 
@@ -2984,16 +3210,26 @@ def run_codex_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
 
     tier_a_skills_copy(ctx)
     tier_a_commands_to_cursor_skills(ctx, "prompts", "prompts")
+    _cursor_native_dirs_note(ctx, ".codex", ("skills", "agents"))
 
+    effort_cfg = cfg.get("model_reasoning_effort")
     if isinstance(cfg.get("model"), str):
-        cursor_cli_config_write_model(ctx, cfg["model"])
+        effort = None
+        if isinstance(effort_cfg, str):
+            effort = cursor_effort_from(
+                ctx, effort_cfg, "config.toml:model_reasoning_effort")
+        cursor_cli_config_write_model(ctx, cfg["model"], effort)
         ctx.report.migrated_clean.append(
-            "config.toml:model → cli-config.json:model")
+            "config.toml:model → cli-config.json:model"
+            + (f" (effort={effort})" if effort else ""))
+    elif effort_cfg:
+        ctx.report.skipped_unmappable.append(
+            "config.toml:model_reasoning_effort (Cursor stores effort per "
+            "model — set config.toml:model too)")
 
     # Codex-only items with no Cursor equivalent.
     for k in ("approval_policy", "sandbox_mode", "sandbox_workspace_write",
-              "shell_environment_policy", "profiles",
-              "model_reasoning_effort", "notify"):
+              "shell_environment_policy", "profiles", "notify"):
         if k in cfg:
             ctx.report.skipped_unmappable.append(
                 f"config.toml:{k} (Cursor has no equivalent)")
@@ -3034,9 +3270,18 @@ def run_cursor_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         dst = ctx.dst_root / "config.toml"
         existing = load_toml(dst) if (ctx.merge and dst.exists()) else {}
         existing["model"] = model
-        write_text(ctx, dst, render_toml(existing))
         ctx.report.migrated_clean.append(
             "cli-config.json:model → config.toml:model")
+        effort = cursor_cli_config_read_effort(ctx.src_root)
+        if effort in CURSOR_EFFORT_VALUES:
+            existing["model_reasoning_effort"] = effort
+            ctx.report.migrated_clean.append(
+                f"cli-config.json effort={effort} → model_reasoning_effort")
+        elif effort:
+            ctx.report.skipped_unmappable.append(
+                f"cli-config.json effort={effort!r} (no Codex reasoning "
+                "effort equivalent)")
+        write_text(ctx, dst, render_toml(existing))
 
     _run_lossy(ctx, lossy_decisions, "cursor->codex")
 
@@ -3390,8 +3635,9 @@ def _apply_codex_sandbox(ctx: Ctx) -> None:
 # same event names and the same {matcher, hooks:[{type:"command",...}]}
 # shape), so shared events translate almost verbatim. Claude's
 # `Notification` event has no Codex hook equivalent but maps onto the
-# legacy `notify` program. Non-command hook types (http, mcp_tool, prompt,
-# agent) and either side's exclusive events are dropped with notes —
+# legacy `notify` program; Codex's `Interrupt` (0.15x) has no Claude
+# event. Command and mcp_tool handlers translate; http/prompt/agent
+# handlers and either side's exclusive events are dropped with notes —
 # that residual loss is why this stays Tier B.
 
 HOOK_EVENTS_SHARED_CODEX = (
@@ -3440,20 +3686,33 @@ def _extract_first_command(entries: list) -> list[str] | None:
 
 def _command_hooks_only(ctx: Ctx, event: str, grp: dict,
                         source: str) -> list[dict]:
-    """Filter one hook group down to command-type hooks, keeping the
-    fields both tools understand. Non-command hooks are noted."""
+    """Filter one hook group down to the handler types both Claude Code
+    and Codex run — `command`, and (Codex 0.15x+) `mcp_tool` with the same
+    server/tool/input shape — keeping the fields both understand. `${…}`
+    input templates pass through verbatim for review; other handler types
+    (http, prompt, agent) are noted."""
     out: list[dict] = []
     for h in grp.get("hooks") or []:
-        if h.get("type") == "command" and h.get("command"):
-            kept = {"type": "command", "command": h["command"]}
-            for k in ("timeout", "statusMessage"):
-                if h.get(k):
-                    kept[k] = h[k]
-            out.append(kept)
+        kind = h.get("type")
+        if kind == "command" and h.get("command"):
+            kept: dict[str, Any] = {"type": "command", "command": h["command"]}
+        elif kind == "mcp_tool" and h.get("server") and h.get("tool"):
+            kept = {"type": "mcp_tool", "server": h["server"],
+                    "tool": h["tool"]}
+            if isinstance(h.get("input"), dict) and h["input"]:
+                kept["input"] = h["input"]
+                ctx.report.notes.append(
+                    f"{source}:{event}: mcp_tool hook input templates "
+                    "carried verbatim — check the ${…} field names resolve "
+                    "on the destination")
         else:
             ctx.report.notes.append(
-                f"{source}:{event}: non-command hook "
-                f"(type={h.get('type')!r}) not translated")
+                f"{source}:{event}: hook type {kind!r} not translated")
+            continue
+        for k in ("timeout", "statusMessage"):
+            if h.get(k):
+                kept[k] = h[k]
+        out.append(kept)
     return out
 
 
@@ -3486,7 +3745,7 @@ def _apply_claude_notify_hook(ctx: Ctx) -> None:
         write_text(ctx, dst_hooks, json.dumps(existing_hooks, indent=2) + "\n")
         ctx.report.migrated_lossy.append(
             f"hooks ({', '.join(migrated_events)}) → .codex/hooks.json "
-            "(command hooks only)")
+            "(command/mcp_tool hooks only)")
 
     # Notification → legacy notify program.
     cmd = _extract_first_command(hooks.get("Notification"))
@@ -3505,12 +3764,26 @@ def _apply_claude_notify_hook(ctx: Ctx) -> None:
                 f"hooks.{k} (no Codex hook event equivalent)")
 
 
+def codex_read_hooks(root: Path) -> dict:
+    """Codex hooks live in hooks.json and/or an inline `[hooks]` table in
+    config.toml (same schema); merge both, hooks.json first."""
+    merged: dict = {}
+    for source in (load_json(root / "hooks.json").get("hooks"),
+                   load_toml(root / "config.toml").get("hooks")):
+        if not isinstance(source, dict):
+            continue
+        for event, groups in source.items():
+            if isinstance(groups, list):
+                merged.setdefault(event, []).extend(groups)
+    return merged
+
+
 def _detect_codex_hooks(ctx: Ctx) -> bool:
-    return bool(load_json(ctx.src_root / "hooks.json").get("hooks"))
+    return bool(codex_read_hooks(ctx.src_root))
 
 
 def _preview_codex_hooks(ctx: Ctx) -> str:
-    hooks = load_json(ctx.src_root / "hooks.json").get("hooks") or {}
+    hooks = codex_read_hooks(ctx.src_root)
     shared = [k for k in hooks if k in HOOK_EVENTS_SHARED_CODEX]
     other = [k for k in hooks if k not in HOOK_EVENTS_SHARED_CODEX]
     msg = f"hooks.json: {', '.join(shared) or '(none)'} → settings.json:hooks"
@@ -3520,7 +3793,7 @@ def _preview_codex_hooks(ctx: Ctx) -> str:
 
 
 def _apply_codex_hooks(ctx: Ctx) -> None:
-    hooks = load_json(ctx.src_root / "hooks.json").get("hooks") or {}
+    hooks = codex_read_hooks(ctx.src_root)
     dst = ctx.dst_root / "settings.json"
     existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
     out = existing.setdefault("hooks", {})
@@ -3550,7 +3823,7 @@ def _apply_codex_hooks(ctx: Ctx) -> None:
         write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
         ctx.report.migrated_lossy.append(
             f"hooks.json ({', '.join(migrated_events)}) → settings.json:hooks "
-            "(command hooks only)")
+            "(command/mcp_tool hooks only)")
 
 
 def _detect_codex_notify(ctx: Ctx) -> bool:
@@ -3836,6 +4109,7 @@ HOOK_EVENTS_CLAUDE_TO_CURSOR = {
     "SubagentStart": "subagentStart",
     "SubagentStop": "subagentStop",
     "UserPromptSubmit": "beforeSubmitPrompt",
+    "PostToolUseFailure": "postToolUseFailure",
 }
 HOOK_EVENTS_CURSOR_TO_CLAUDE = {v: k for k, v in
                                 HOOK_EVENTS_CLAUDE_TO_CURSOR.items()}
@@ -4131,9 +4405,10 @@ TIER_B: list[LossyOption] = [
         direction="claude->codex",
         label="hooks → .codex/hooks.json (+ Notification → notify)",
         rationale=("Codex hooks share Claude's event names and shape, so "
-                   "command hooks on shared events translate near-verbatim. "
-                   "Notification maps to the legacy notify program; "
-                   "non-command hook types and Claude-only events drop."),
+                   "command and mcp_tool hooks on shared events translate "
+                   "near-verbatim. Notification maps to the legacy notify "
+                   "program; http/prompt/agent hooks and Claude-only "
+                   "events drop."),
         detect=_detect_claude_notify_hook,
         preview=_preview_claude_notify_hook,
         apply=_apply_claude_notify_hook,
@@ -4142,9 +4417,10 @@ TIER_B: list[LossyOption] = [
         id="codex_hooks",
         direction="codex->claude",
         label="hooks.json → settings.json:hooks",
-        rationale=("Command hooks on shared events translate near-verbatim; "
-                   "commandWindows variants and non-command hook types are "
-                   "dropped."),
+        rationale=("Command and mcp_tool hooks on shared events translate "
+                   "near-verbatim (hooks.json and inline [hooks]); "
+                   "commandWindows variants, other hook types and "
+                   "Codex-only events (Interrupt) are dropped."),
         detect=_detect_codex_hooks,
         preview=_preview_codex_hooks,
         apply=_apply_codex_hooks,
@@ -4184,9 +4460,11 @@ TIER_B: list[LossyOption] = [
         id="agents_cursor",
         direction="claude->cursor",
         label="agents/ → .cursor/agents/*.md (native Cursor subagents)",
-        rationale=("Cursor 2.4+ runs subagents natively. name/description/"
-                   "model/effort/background translate; Claude-only fields "
-                   "(tools, hooks, memory, skills, …) are dropped with notes."),
+        rationale=("Cursor runs subagents natively and even reads "
+                   ".claude/agents in place; this copy makes .cursor/agents "
+                   "canonical. name/description/model/effort/background "
+                   "translate; Claude-only fields (tools, hooks, memory, "
+                   "skills, omitClaudeMd, …) are dropped with notes."),
         detect=_detect_claude_agents_cursor,
         preview=_preview_claude_agents_cursor,
         apply=_apply_claude_agents_cursor,

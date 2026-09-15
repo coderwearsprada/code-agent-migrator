@@ -1636,7 +1636,10 @@ class PiRunnerTests(FsTestBase):
     def test_bare_pi_skill_becomes_skill_dir(self):
         skills = self.src / "skills"
         skills.mkdir()
-        (skills / "quick.md").write_text("# Quick helper\nDoes things.\n")
+        # pi only treats a root .md as a skill when its frontmatter has a
+        # description; `name` is optional there but required by SKILL.md.
+        (skills / "quick.md").write_text(
+            "---\ndescription: Quick helper\n---\n# Quick helper\nDoes things.\n")
         ctx = make_ctx(self.src, self.dst)
         m.skills_from_pi(ctx)
 
@@ -1769,6 +1772,332 @@ class CursorFullRoundTripTests(FsTestBase):
 
         self.assertTrue((c2 / "rules" / "outside.mdc").exists())
         self.assertFalse((self.tmp / "outside.mdc").exists())
+
+
+class SeptemberSyncTests(FsTestBase):
+    """Mappings refreshed for the 2026-09 tool releases: Claude Code
+    2.1.271, Codex 0.154, Cursor CLI 2026.09.10, opencode 1.18.31, pi 0.85.1."""
+
+    # ---- Claude / Codex settings surface ----------------------------------
+
+    def test_new_claude_settings_keys_are_reported(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "maxEffortLevel": "high", "timeFormat": "24h",
+            "bashOutputMaxChars": 64000,
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_claude_to_codex(ctx)
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        for key in ("maxEffortLevel", "timeFormat", "bashOutputMaxChars"):
+            self.assertIn(key, skipped)
+
+    def test_new_codex_config_keys_are_reported(self):
+        (self.src / "config.toml").write_text(
+            'model_instructions_file = "/x/instr.md"\n'
+            'plan_mode_reasoning_effort = "low"\n'
+            '[skills]\nmax_context_tokens = 2000\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_codex_to_claude(ctx)
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        for key in ("model_instructions_file", "plan_mode_reasoning_effort",
+                    "skills"):
+            self.assertIn(key, skipped)
+
+    def test_codex_persistent_effort_is_reported_not_mapped(self):
+        (self.src / "config.toml").write_text(
+            'model_reasoning_effort = "persistent"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_codex_to_claude(ctx)
+        self.assertFalse((self.dst / "settings.json").exists())
+        self.assertTrue(any("persistent" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_developer_instructions_unwrap_into_claude_md(self):
+        (self.src / "AGENTS.md").write_text("Doc.\n")
+        (self.src / "config.toml").write_text(
+            'developer_instructions = "Be terse."\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_docs_codex_to_claude(ctx)
+        text = (self.dst / "CLAUDE.md").read_text()
+        self.assertIn("kind=developer_instructions", text)
+        self.assertIn("Be terse.", text)
+        self.assertTrue(any("developer_instructions" in s
+                            for s in ctx.report.migrated_clean))
+
+    def test_plan_permission_mode_becomes_read_only_codex_agent(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "auditor.md").write_text(
+            "---\nname: auditor\ndescription: Audits\npermissionMode: plan\n"
+            "omitClaudeMd: true\n---\nAudit.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_agents(ctx)
+        cfg = tomllib.loads((self.dst / "agents" / "auditor.toml").read_text())
+        self.assertEqual(cfg["sandbox_mode"], "read-only")
+        # Unknown Claude-only fields are surfaced for review, not lost.
+        self.assertIn("omitClaudeMd", cfg["developer_instructions"])
+
+    # ---- Codex hooks: mcp_tool handlers, inline [hooks], Interrupt --------
+
+    def test_mcp_tool_hooks_translate_both_ways(self):
+        (self.src / "settings.json").write_text(json.dumps({"hooks": {
+            "PostToolUse": [{"matcher": "Write|Edit", "hooks": [
+                {"type": "mcp_tool", "server": "scanner", "tool": "scan_file",
+                 "input": {"path": "${tool_input.file_path}"}, "timeout": 30},
+                {"type": "http", "url": "http://localhost/hook"},
+            ]}]}}))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_notify_hook(ctx)
+        hooks = json.loads((self.dst / "hooks.json").read_text())["hooks"]
+        kept = hooks["PostToolUse"][0]["hooks"]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["type"], "mcp_tool")
+        self.assertEqual(kept[0]["server"], "scanner")
+        self.assertEqual(kept[0]["input"], {"path": "${tool_input.file_path}"})
+        self.assertEqual(kept[0]["timeout"], 30)
+        self.assertTrue(any("'http'" in n for n in ctx.report.notes))
+        self.assertTrue(any("templates" in n for n in ctx.report.notes))
+        # And back: Codex hooks.json mcp_tool → Claude settings hooks.
+        back = self.tmp / "back"
+        back.mkdir()
+        m._apply_codex_hooks(make_ctx(self.dst, back))
+        settings = json.loads((back / "settings.json").read_text())
+        self.assertEqual(
+            settings["hooks"]["PostToolUse"][0]["hooks"][0]["tool"], "scan_file")
+
+    def test_inline_codex_hooks_table_is_read_and_interrupt_dropped(self):
+        # Array-of-tables is how the Codex docs spell an inline [hooks]
+        # table; the 3.9/3.10 fallback reader must handle it too.
+        (self.src / "config.toml").write_text(
+            "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\n"
+            'type = "command"\ncommand = "echo done"\n\n'
+            "[[hooks.Interrupt]]\n[[hooks.Interrupt.hooks]]\n"
+            'type = "command"\ncommand = "echo int"\n')
+        (self.src / "hooks.json").write_text(json.dumps({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command",
+                                         "command": "echo hi"}]}]}}))
+        ctx = make_ctx(self.src, self.dst)
+        self.assertTrue(m._detect_codex_hooks(ctx))
+        m._apply_codex_hooks(ctx)
+        hooks = json.loads((self.dst / "settings.json").read_text())["hooks"]
+        self.assertEqual(hooks["Stop"][0]["hooks"][0]["command"], "echo done")
+        self.assertIn("SessionStart", hooks)
+        self.assertNotIn("Interrupt", hooks)
+        self.assertTrue(any("Interrupt" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_toml_reader_arrays_of_tables(self):
+        data = tomllib.loads(
+            '[[mcp_servers.a.items]]\nx = 1\n[[mcp_servers.a.items]]\nx = 2\n'
+            '[mcp_servers.b]\ncommand = "srv"\n')
+        self.assertEqual([i["x"] for i in data["mcp_servers"]["a"]["items"]],
+                         [1, 2])
+        self.assertEqual(data["mcp_servers"]["b"]["command"], "srv")
+
+    # ---- Cursor CLI config: model object + effort parameter ---------------
+
+    def test_cursor_cli_config_model_is_written_as_model_details(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "model": "claude-opus-5", "effortLevel": "xhigh",
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_cursor(ctx, lossy_decisions={})
+        cfg = json.loads((self.dst / "cli-config.json").read_text())
+        self.assertEqual(cfg["version"], 1)
+        self.assertEqual(cfg["model"]["modelId"], "claude-opus-5")
+        self.assertEqual(cfg["model"]["displayName"], "claude-opus-5")
+        self.assertTrue(cfg["hasChangedDefaultModel"])
+        self.assertEqual(cfg["selectedModel"], {
+            "modelId": "claude-opus-5",
+            "parameters": [{"id": "effort", "value": "high"}]})
+        self.assertEqual(cfg["modelParameters"]["claude-opus-5"],
+                         [{"id": "effort", "value": "high"}])
+        # xhigh collapsed to high with a note — not reported as dropped.
+        self.assertTrue(any("top out" in n for n in ctx.report.notes))
+        self.assertFalse(any("effortLevel" in s
+                             for s in ctx.report.skipped_unmappable))
+
+    def test_cursor_cli_config_merge_keeps_permissions(self):
+        (self.dst / "cli-config.json").write_text(json.dumps({
+            "version": 1,
+            "permissions": {"allow": ["Shell(ls)"], "deny": []},
+            "model": {"modelId": "gpt-5", "displayName": "GPT-5"},
+        }))
+        (self.src / "config.toml").write_text(
+            'model = "gpt-5.6"\nmodel_reasoning_effort = "ultra"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.run_codex_to_cursor(ctx, lossy_decisions={})
+        cfg = json.loads((self.dst / "cli-config.json").read_text())
+        self.assertEqual(cfg["permissions"]["allow"], ["Shell(ls)"])
+        self.assertEqual(cfg["model"]["modelId"], "gpt-5.6")
+        self.assertEqual(cfg["selectedModel"]["parameters"],
+                         [{"id": "effort", "value": "high"}])
+        self.assertFalse(any("model_reasoning_effort" in s
+                             for s in ctx.report.skipped_unmappable))
+
+    def test_cursor_effort_below_low_is_reported(self):
+        (self.src / "config.toml").write_text(
+            'model = "gpt-5.6"\nmodel_reasoning_effort = "minimal"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.run_codex_to_cursor(ctx, lossy_decisions={})
+        cfg = json.loads((self.dst / "cli-config.json").read_text())
+        self.assertEqual(cfg["selectedModel"]["parameters"], [])
+        self.assertNotIn("modelParameters", cfg)
+        self.assertTrue(any("minimal" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_cursor_cli_config_read_prefers_selected_model_and_effort(self):
+        (self.src / "cli-config.json").write_text(json.dumps({
+            "version": 1,
+            "model": {"modelId": "gpt-5", "displayName": "GPT-5"},
+            "selectedModel": {"modelId": "claude-opus-5",
+                              "parameters": [{"id": "effort",
+                                              "value": "medium"}]},
+            "modelParameters": {"claude-opus-5": [{"id": "effort",
+                                                   "value": "medium"}]},
+            "hasChangedDefaultModel": True,
+        }))
+        self.assertEqual(m.cursor_cli_config_read_model(self.src),
+                         "claude-opus-5")
+        self.assertEqual(m.cursor_cli_config_read_effort(self.src), "medium")
+        ctx = make_ctx(self.src, self.dst)
+        m.run_cursor_to_claude(ctx, lossy_decisions={})
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(settings["model"], "claude-opus-5")
+        self.assertEqual(settings["effortLevel"], "medium")
+
+    def test_cursor_cli_config_legacy_string_model_still_reads(self):
+        (self.src / "cli-config.json").write_text(
+            json.dumps({"version": 1, "model": "gpt-5"}))
+        self.assertEqual(m.cursor_cli_config_read_model(self.src), "gpt-5")
+        self.assertIsNone(m.cursor_cli_config_read_effort(self.src))
+
+    def test_cursor_effort_reaches_codex_and_pi(self):
+        (self.src / "cli-config.json").write_text(json.dumps({
+            "version": 1,
+            "selectedModel": {"modelId": "gpt-5.6",
+                              "parameters": [{"id": "effort",
+                                              "value": "high"}]},
+        }))
+        m.run_cursor_to_codex(make_ctx(self.src, self.dst), lossy_decisions={})
+        cfg = tomllib.loads((self.dst / "config.toml").read_text())
+        self.assertEqual(cfg["model"], "gpt-5.6")
+        self.assertEqual(cfg["model_reasoning_effort"], "high")
+        pi = self.tmp / "pi"
+        pi.mkdir()
+        m.run_cursor_to_pi(make_ctx(self.src, pi), lossy_decisions={})
+        settings = json.loads((pi / "settings.json").read_text())
+        self.assertEqual(settings["defaultThinkingLevel"], "high")
+
+    def test_post_tool_use_failure_maps_to_cursor_and_back(self):
+        (self.src / "settings.json").write_text(json.dumps({"hooks": {
+            "PostToolUseFailure": [{"hooks": [{"type": "command",
+                                               "command": "./log.sh"}]}]}}))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_hooks_cursor(ctx)
+        data = json.loads((self.dst / "hooks.json").read_text())
+        self.assertEqual(data["hooks"]["postToolUseFailure"][0]["command"],
+                         "./log.sh")
+        back = self.tmp / "back"
+        back.mkdir()
+        m._apply_cursor_hooks(make_ctx(self.dst, back))
+        settings = json.loads((back / "settings.json").read_text())
+        self.assertIn("PostToolUseFailure", settings["hooks"])
+
+    def test_cursor_native_dirs_are_noted(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "a.toml").write_text(
+            'name = "a"\ndescription = "d"\ndeveloper_instructions = "x"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.run_codex_to_cursor(ctx, lossy_decisions={})
+        self.assertTrue(any(".codex/{agents}" in n for n in ctx.report.notes))
+
+    # ---- pi: AGENTS.override.md, bare skills, per-model thinking ----------
+
+    def test_pi_agents_override_is_migrated_instead_of_agents_md(self):
+        (self.src / "AGENTS.md").write_text("Old.\n")
+        (self.src / "AGENTS.override.md").write_text("Override.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_codex(ctx, lossy_decisions={})
+        text = (self.dst / "AGENTS.md").read_text()
+        self.assertIn("Override.", text)
+        self.assertNotIn("Old.", text)
+        self.assertTrue(any("AGENTS.override.md" in n
+                            for n in ctx.report.notes))
+
+    def test_pi_agents_override_into_claude_md(self):
+        (self.src / "AGENTS.override.md").write_text("Override.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_claude(ctx, lossy_decisions={})
+        self.assertIn("Override.", (self.dst / "CLAUDE.md").read_text())
+
+    def test_destination_pi_override_shadow_is_noted(self):
+        (self.src / "CLAUDE.md").write_text("Doc.\n")
+        (self.dst / "AGENTS.override.md").write_text("Local override.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_pi(ctx, lossy_decisions={})
+        self.assertTrue((self.dst / "AGENTS.md").exists())
+        self.assertTrue(any("AGENTS.override.md exists" in n
+                            for n in ctx.report.notes))
+
+    def test_bare_pi_skill_without_description_is_skipped(self):
+        skills = self.src / "skills"
+        skills.mkdir()
+        (skills / "README.md").write_text("# Not a skill\nNotes.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m.skills_from_pi(ctx)
+        self.assertFalse((self.dst / "skills").exists())
+        self.assertTrue(any("README.md" in n and "not migrated" in n
+                            for n in ctx.report.notes))
+
+    def test_pi_model_thinking_level_overrides_default_for_startup_model(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "defaultProvider": "anthropic", "defaultModel": "claude-opus-5",
+            "defaultThinkingLevel": "medium",
+            "modelThinkingLevels": {"anthropic/claude-opus-5": "high",
+                                    "openai/gpt-5.6": "low"},
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_codex(ctx, lossy_decisions={})
+        cfg = tomllib.loads((self.dst / "config.toml").read_text())
+        self.assertEqual(cfg["model_reasoning_effort"], "high")
+        self.assertTrue(any("overrides defaultThinkingLevel" in n
+                            for n in ctx.report.notes))
+        self.assertTrue(any("openai/gpt-5.6" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_pi_thinking_reaches_cursor_as_effort_parameter(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "defaultProvider": "openai", "defaultModel": "gpt-5.6",
+            "defaultThinkingLevel": "max",
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_cursor(ctx, lossy_decisions={})
+        cfg = json.loads((self.dst / "cli-config.json").read_text())
+        self.assertEqual(cfg["model"]["modelId"], "gpt-5.6")
+        self.assertEqual(cfg["selectedModel"]["parameters"],
+                         [{"id": "effort", "value": "high"}])
+
+    def test_new_pi_settings_keys_are_reported(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "defaultTools": ["bash"], "tuiMode": "fullscreen"}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_claude(ctx, lossy_decisions={})
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        self.assertIn("defaultTools", skipped)
+        self.assertIn("tuiMode", skipped)
+
+    # ---- opencode ---------------------------------------------------------
+
+    def test_new_opencode_keys_are_reported(self):
+        (self.src / "opencode.json").write_text(json.dumps({
+            "tui": {"scroll_speed": 2}, "default_agent": "build"}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_opencode_to_claude(ctx, lossy_decisions={})
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        self.assertIn("tui", skipped)
+        self.assertIn("default_agent", skipped)
 
 
 if __name__ == "__main__":
