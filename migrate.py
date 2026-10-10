@@ -2,7 +2,8 @@
 """
 migrate.py — Migrate settings + custom configuration between Claude Code
 (~/.claude), Codex CLI (~/.codex), Cursor (~/.cursor), opencode
-(~/.config/opencode), and pi (~/.pi/agent), in any pairwise direction.
+(~/.config/opencode), pi (~/.pi/agent), and agentty (~/.agentty), in any
+pairwise direction.
 
 Requires Python 3.9+. No third-party dependencies.
 
@@ -40,9 +41,12 @@ reverse direction recognizes and unwraps. See the `fenced_block` /
 `extract_fenced` and `frontmatter_to_meta_comment` /
 `meta_comment_to_frontmatter` helpers.
 
-Skills need none of that: Claude Code, Codex CLI, and Cursor all speak the
-open Agent Skills format (skills/<name>/SKILL.md + assets), so skills copy
-verbatim in every direction.
+Skills need none of that: Claude Code, Codex CLI, Cursor, opencode and pi
+all speak the open Agent Skills format (skills/<name>/SKILL.md + assets), so
+skills copy verbatim in every direction. agentty is the odd one out — it
+orchestrates the other CLIs as backends and owns only per-project model
+defaults (in SQLite), so its pairs carry model/effort/speed and note the
+rest.
 """
 
 from __future__ import annotations
@@ -54,6 +58,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -256,44 +261,32 @@ MIGRATOR_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
-CLAUDE_UNMAPPABLE_KEYS = (
-    "statusLine", "outputStyle",  # outputStyle handled as Tier A (content)
-    "agentPushNotifEnabled", "remoteControlAtStartup",
-    "autoUpdates", "verbose", "theme", "preferredNotifChannel",
-    "enableAllProjectMcpServers", "enabledMcpjsonServers",
-    "disabledMcpjsonServers", "alwaysThinkingEnabled",
-    # Newer Claude Code (2.1.15x+) surface with no Codex equivalent.
-    "fallbackModel", "availableModels", "defaultMode", "autoMemoryEnabled",
-    "attribution", "sandbox", "autoMode",
-    # 2.1.20x additions.
-    "disableAutoMode", "emojiCompletionEnabled", "workflowSizeGuideline",
-    "vimInsertModeRemaps",
-    # 2.1.22x–2.1.27x additions (settings reference as of 2026-09-14).
-    "maxEffortLevel", "modelSettings", "modelOverrides", "advisorModel",
-    "fastMode", "language", "timeFormat", "timeZone", "defaultShell",
-    "editorMode", "bashOutputMaxChars", "taskOutputMaxChars",
-    "autoCompactEnabled", "claudeMdExcludes", "plansDirectory",
-    "includeCoAuthoredBy", "includeGitInstructions", "respectGitignore",
-    "enabledPlugins", "extraKnownMarketplaces", "pluginConfigs",
-    "skillOverrides", "cleanupPeriodDays", "apiKeyHelper",
-    "forceLoginMethod", "teammateMode", "worktree", "agent",
-)
-CODEX_UNMAPPABLE_KEYS = (
-    "model_provider", "model_providers", "tools", "tui",
-    "hide_agent_reasoning", "show_raw_agent_reasoning",
-    "model_reasoning_summary", "reasoning_summary", "model_verbosity",
-    "disable_response_storage", "history", "project_doc_max_bytes",
-    # Newer Codex (0.13x+) surface with no Claude Code equivalent.
-    "web_search", "features", "default_permissions", "permissions",
-    "agents", "memories", "apps", "plugins", "service_tier",
-    "project_doc_fallback_filenames",
-    # 0.147–0.154 surface (config reference as of 2026-09-14).
-    "model_instructions_file", "plan_mode_reasoning_effort", "personality",
-    "review_model", "approvals_reviewer", "auto_review", "skills",
-    "tool_suggest", "tool_output_token_limit", "computer_use",
-    "browser_use", "otel", "marketplaces", "projects",
-    "project_root_markers", "compact_prompt",
-)
+# Settings keys each direction *consumes* — mapped as Tier A or handed to
+# a Tier B option. Every other top-level key is reported under "not
+# translated" so a key a newer release adds never vanishes silently. (The
+# inverse — hand-maintained Claude-only/Codex-only lists — drifted on every
+# sync; the consumed sets are small and stable.)
+CLAUDE_SETTINGS_HANDLED = frozenset((
+    "$schema", "model", "env", "effortLevel", "fastMode", "permissions",
+    "hooks", "outputStyle", "mcpServers",
+))
+CODEX_CONFIG_HANDLED = frozenset((
+    "model", "mcp_servers", "shell_environment_policy",
+    "model_reasoning_effort", "service_tier", "features",
+    "developer_instructions", "instructions", "notify", "hooks",
+    "profile", "profiles", "sandbox_mode", "approval_policy",
+    "sandbox_workspace_write",
+))
+
+
+def report_unhandled_keys(ctx: Ctx, data: dict, handled: Iterable[str],
+                          source: str, reason: str) -> None:
+    """Report every top-level key the current direction doesn't consume."""
+    handled = set(handled)
+    for k in data:
+        if k not in handled:
+            ctx.report.skipped_unmappable.append(f"{source}:{k} ({reason})")
+
 
 # Claude `effortLevel` and Codex `model_reasoning_effort` share the
 # low/medium/high/xhigh vocabulary (Claude Code 2.1+; Codex), so those map 1:1.
@@ -810,11 +803,11 @@ def tier_a_docs_codex_to_claude(ctx: Ctx, src: Path | None = None) -> None:
     dst = ctx.dst_doc or (ctx.dst_root / "CLAUDE.md")
 
     content_parts: list[str] = []
+    native = False
     if src.exists():
         project_root = claude_project_root(ctx)
         if project_root and src == project_root / "AGENTS.md":
-            content_parts.append("@AGENTS.md\n")
-            ctx.report.migrated_clean.append("AGENTS.md → CLAUDE.md import")
+            native = True
         else:
             content_parts.append(src.read_text(encoding="utf-8").rstrip() + "\n")
 
@@ -828,6 +821,22 @@ def tier_a_docs_codex_to_claude(ctx: Ctx, src: Path | None = None) -> None:
             ctx.report.migrated_clean.append(
                 f"config.toml:{key} → fenced block in CLAUDE.md")
 
+    if native:
+        # Claude Code 2.1.277+ reads a project's AGENTS.md itself when no
+        # CLAUDE.md exists (the built-in "Project instructions" plugin), so
+        # an @import is only needed once a CLAUDE.md is in play anyway —
+        # because one already exists or because fenced content lands in it.
+        existing_text = (dst.read_text(encoding="utf-8")
+                         if dst.exists() and ctx.merge else "")
+        if dst.exists() or content_parts:
+            if "@AGENTS.md" not in existing_text:
+                content_parts.insert(0, "@AGENTS.md\n")
+            ctx.report.migrated_clean.append("AGENTS.md → CLAUDE.md import")
+        else:
+            ctx.report.notes.append(
+                "AGENTS.md at the project root is read natively by Claude "
+                "Code 2.1.277+ when no CLAUDE.md exists — nothing written")
+
     if not content_parts:
         return
 
@@ -836,7 +845,7 @@ def tier_a_docs_codex_to_claude(ctx: Ctx, src: Path | None = None) -> None:
         existing = dst.read_text(encoding="utf-8").rstrip()
         body = existing + "\n\n" + body if existing else body
     write_text(ctx, dst, body)
-    if src.exists() and not any("AGENTS.md → CLAUDE.md import" in x for x in ctx.report.migrated_clean):
+    if src.exists() and not native:
         ctx.report.migrated_clean.append(f"{src.name} → {dst.name}")
 
 
@@ -1250,10 +1259,18 @@ def tier_a_settings_claude_to_codex(ctx: Ctx) -> None:
                 f"effortLevel={settings['effortLevel']} → "
                 f"model_reasoning_effort={mapped}")
 
-    for k in CLAUDE_UNMAPPABLE_KEYS:
-        if k in settings:
-            ctx.report.skipped_unmappable.append(
-                f"settings.json:{k} (no Codex equivalent)")
+    # Fast mode is the same knob on both sides — pricier, lower-latency
+    # inference on the models that support it (Opus 5.5 / GPT-6.x).
+    # Claude Code persists `/fast` as `fastMode: true`; Codex persists it
+    # as `service_tier = "fast"` plus the `[features] fast_mode` gate.
+    if settings.get("fastMode") is True:
+        existing["service_tier"] = "fast"
+        existing.setdefault("features", {})["fast_mode"] = True
+        ctx.report.migrated_clean.append(
+            'fastMode=true → service_tier="fast" + [features] fast_mode')
+
+    report_unhandled_keys(ctx, settings, CLAUDE_SETTINGS_HANDLED,
+                          "settings.json", "no Codex equivalent")
 
     if existing:
         write_text(ctx, dst, render_toml(existing))
@@ -1310,10 +1327,23 @@ def tier_a_settings_codex_to_claude(ctx: Ctx) -> None:
                 f"model_reasoning_effort={eff!r} (no Claude effortLevel "
                 "equivalent)")
 
-    for k in CODEX_UNMAPPABLE_KEYS:
-        if k in cfg:
-            ctx.report.skipped_unmappable.append(
-                f"config.toml:{k} (no Claude Code equivalent)")
+    tier = cfg.get("service_tier")
+    if tier == "fast":
+        existing["fastMode"] = True
+        ctx.report.migrated_clean.append('service_tier="fast" → fastMode=true')
+    elif isinstance(tier, str):
+        ctx.report.skipped_unmappable.append(
+            f"config.toml:service_tier={tier!r} (Claude Code only has fast "
+            "mode on/off)")
+    features = cfg.get("features") if isinstance(cfg.get("features"), dict) else {}
+    other_features = sorted(k for k in features if k != "fast_mode")
+    if other_features:
+        ctx.report.skipped_unmappable.append(
+            f"config.toml:[features] {', '.join(other_features)} "
+            "(no Claude Code equivalent)")
+
+    report_unhandled_keys(ctx, cfg, CODEX_CONFIG_HANDLED,
+                          "config.toml", "no Claude Code equivalent")
 
     if existing:
         write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
@@ -1650,15 +1680,10 @@ def _native_mcp_from_codex(name: str, spec: dict) -> dict:
 
 OPENCODE_PROVIDER_FOR_TOOL = {"claude": "anthropic", "codex": "openai"}
 
-OPENCODE_UNMAPPABLE_KEYS = (
-    "provider", "plugin", "formatter", "lsp", "share", "autoupdate",
-    "snapshot", "compaction", "keybinds", "theme", "tools", "watcher",
-    "disabled_providers", "enabled_providers", "experimental", "server",
-    "subagent_depth",  # 1.18.2+: no cross-tool nesting-depth equivalent
-    # TUI/shell knobs and the default-agent pick (docs as of 1.18.31).
-    "tui", "default_agent", "shell", "attachment", "attention",
-    "diff_style", "mouse", "cursor", "scroll_speed", "scroll_acceleration",
-)
+# opencode.json keys a migration consumes; everything else is reported.
+OPENCODE_CONFIG_HANDLED = frozenset((
+    "$schema", "model", "mcp", "permission", "instructions", "small_model",
+))
 
 
 def _strip_jsonc(text: str) -> str:
@@ -1974,9 +1999,11 @@ def _opencode_perms_to_claude(permission: dict, report: Report) -> dict:
 # templates (prompts/*.md, description/argument-hint frontmatter,
 # $ARGUMENTS substitution) are format-identical to Codex custom prompts.
 # settings.json carries defaultProvider/defaultModel/defaultThinkingLevel.
-# pi deliberately has NO MCP, NO subagents, and NO hooks (extensions are
-# TypeScript code) — those source features become report notes, so every
-# pi pair is Tier A only.
+# MCP arrived in pi 0.99 (mcp.json with `mcpServers` in the Claude shape:
+# stdio command/args/env or streamable-HTTP url/headers; SSE is rejected),
+# so servers transfer. pi still has NO subagents and NO hooks (extensions
+# are TypeScript code) — those become report notes, so every pi pair is
+# Tier A only.
 
 PI_THINKING_TO_CLAUDE = {
     "minimal": "low", "low": "low", "medium": "medium", "high": "high",
@@ -1994,20 +2021,13 @@ CODEX_EFFORT_TO_PI = {
     "high": "high", "xhigh": "xhigh", "max": "max", "ultra": "max",
 }
 
-PI_UNMAPPABLE_SETTINGS = (
-    "theme", "enabledModels", "thinkingBudgets", "defaultProjectTrust",
-    "externalEditor", "quietStartup", "hideThinkingBlock", "steeringMode",
-    "followUpMode", "transport", "compaction", "retry", "terminal",
-    "images", "shellPath", "shellCommandPrefix", "npmCommand", "sessionDir",
-    "httpProxy", "packages", "extensions", "themes",
-    # Resource arrays point at external dirs — copy those separately.
-    "skills", "prompts",
-    "enableSkillCommands", "enableInstallTelemetry", "enableAnalytics",
-    # 0.84–0.85 additions (settings reference as of 2026-09-14).
-    "defaultTools", "tuiMode", "fullscreenExitOutput", "fullscreenScrollbar",
-    "fullscreenCopyOnSelect", "markdown", "branchSummary",
-    "showCacheMissNotices", "treeFilterMode", "warnings",
-)
+# settings.json keys a migration consumes; everything else is reported.
+PI_SETTINGS_HANDLED = frozenset((
+    "defaultProvider", "defaultModel", "defaultThinkingLevel",
+    "modelThinkingLevels",
+))
+# Resource arrays point at external dirs — copy those separately.
+PI_RESOURCE_KEYS = ("skills", "prompts", "extensions", "packages", "themes")
 
 # pi prompt templates support shell-style default substitutions
 # (`${1:-default}`, `${@:-default}`, `${@:N:L}`) that no other tool
@@ -2057,10 +2077,14 @@ def pi_update_settings(ctx: Ctx, updates: dict) -> None:
 
 
 def pi_report_unmappables(ctx: Ctx, settings: dict) -> None:
-    for k in PI_UNMAPPABLE_SETTINGS:
+    for k in PI_RESOURCE_KEYS:
         if k in settings:
             ctx.report.skipped_unmappable.append(
-                f"settings.json:{k} (pi-only — no equivalent)")
+                f"settings.json:{k} (pi resource paths — copy those dirs "
+                "by hand)")
+    report_unhandled_keys(
+        ctx, {k: v for k, v in settings.items() if k not in PI_RESOURCE_KEYS},
+        PI_SETTINGS_HANDLED, "settings.json", "pi-only — no equivalent")
     for f in ("SYSTEM.md", "APPEND_SYSTEM.md", "keybindings.json",
               "models.json"):
         if (ctx.src_root / f).exists():
@@ -2069,14 +2093,10 @@ def pi_report_unmappables(ctx: Ctx, settings: dict) -> None:
                 "has no equivalent; models.json may contain secrets)")
 
 
-def _pi_feature_gap_notes(ctx: Ctx, mcp: bool = False, agents: bool = False,
+def _pi_feature_gap_notes(ctx: Ctx, agents: bool = False,
                           hooks: bool = False, permissions: bool = False) -> None:
     """Source features pi deliberately doesn't have. Reported once each so
     nothing silently disappears."""
-    if mcp:
-        ctx.report.skipped_unmappable.append(
-            "MCP servers (pi has no MCP — wrap the server as a CLI tool "
-            "with a skill instead)")
     if agents:
         ctx.report.skipped_unmappable.append(
             "subagents (core pi has none — see the pi-subagents community "
@@ -2089,6 +2109,94 @@ def _pi_feature_gap_notes(ctx: Ctx, mcp: bool = False, agents: bool = False,
         ctx.report.skipped_unmappable.append(
             "permission rules (pi uses per-project trust, not per-command "
             "rules)")
+
+
+def _mcp_pi_to_native(name: str, spec: dict, report: Report) -> dict | None:
+    """pi mcp.json entry → Claude-shaped spec. A project entry without
+    command/url only overrides a user-level server's enabled/exposure
+    state, so there is nothing to carry."""
+    if spec.get("command"):
+        out: dict = {"type": "stdio", "command": spec["command"]}
+        if spec.get("args"):
+            out["args"] = list(spec["args"])
+        if spec.get("env"):
+            out["env"] = dict(spec["env"])
+    elif spec.get("url"):
+        out = {"type": "http", "url": spec["url"]}
+        if spec.get("headers"):
+            out["headers"] = dict(spec["headers"])
+    else:
+        report.notes.append(
+            f"mcp.json:{name}: override-only entry (no command/url) — "
+            "not migrated")
+        return None
+    if spec.get("enabled") is False:
+        report.notes.append(
+            f"mcp.json:{name} is disabled in pi — migrated anyway; disable "
+            "it on the destination if you still want it off")
+    pi_only = [k for k in ("exposure", "toolExposure", "description",
+                           "oauth", "auth") if k in spec]
+    if pi_only:
+        report.notes.append(
+            f"mcp.json:{name}: pi-only field(s) {', '.join(pi_only)} dropped")
+    return out
+
+
+def _mcp_native_to_pi(name: str, spec: dict, report: Report) -> dict | None:
+    """Claude-shaped spec → pi mcp.json entry (stdio or streamable HTTP;
+    pi rejects SSE outright and has no WebSocket transport)."""
+    t = _mcp_transport(spec)
+    if t == "stdio":
+        if not spec.get("command"):
+            report.skipped_unmappable.append(
+                f"MCP server '{name}' has no command")
+            return None
+        out: dict = {"command": spec["command"]}
+        if spec.get("args"):
+            out["args"] = list(spec["args"])
+        if spec.get("env"):
+            out["env"] = dict(spec["env"])
+        return out
+    if t == "http" and spec.get("url"):
+        out = {"url": spec["url"]}
+        if spec.get("headers"):
+            out["headers"] = dict(spec["headers"])
+        return out
+    report.skipped_unmappable.append(
+        f"MCP server '{name}' uses type='{t}' (pi supports stdio and "
+        "streamable HTTP; it rejects SSE)")
+    return None
+
+
+def pi_read_mcp(root: Path, report: Report) -> dict:
+    """<root>/mcp.json (user: ~/.pi/agent, project: .pi) as Claude-shaped
+    specs."""
+    out: dict = {}
+    servers = load_json(root / "mcp.json").get("mcpServers")
+    if not isinstance(servers, dict):
+        return out
+    for name, spec in servers.items():
+        if isinstance(spec, dict):
+            native = _mcp_pi_to_native(name, spec, report)
+            if native:
+                out[name] = native
+    return out
+
+
+def pi_write_mcp(ctx: Ctx, servers: dict) -> None:
+    dst = ctx.dst_root / "mcp.json"
+    existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+    existing.setdefault("mcpServers", {})
+    written = 0
+    for name, spec in servers.items():
+        entry = _mcp_native_to_pi(name, spec, ctx.report)
+        if entry is not None:
+            existing["mcpServers"][name] = entry
+            written += 1
+            ctx.report.migrated_clean.append(
+                f"MCP server '{name}' → mcp.json:mcpServers.{name}")
+    if written:
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
 
 
 def skills_from_pi(ctx: Ctx) -> None:
@@ -2234,19 +2342,21 @@ def run_claude_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
                 f"effortLevel={effort} → defaultThinkingLevel={mapped}")
     if updates:
         pi_update_settings(ctx, updates)
+    mcp = claude_read_mcp(ctx)
+    if mcp:
+        pi_write_mcp(ctx, mcp)
 
     _pi_feature_gap_notes(
         ctx,
-        mcp=bool(claude_read_mcp(ctx)),
         agents=(ctx.src_root / "agents").is_dir()
         and any((ctx.src_root / "agents").rglob("*.md")),
         hooks=bool(settings.get("hooks")),
         permissions=bool(settings.get("permissions")),
     )
-    for key in ("env", "statusLine", "outputStyle"):
-        if settings.get(key):
-            ctx.report.skipped_unmappable.append(
-                f"settings.json:{key} (no pi equivalent)")
+    report_unhandled_keys(
+        ctx, settings,
+        ("$schema", "model", "effortLevel", "mcpServers", "hooks", "permissions"),
+        "settings.json", "no pi equivalent")
 
     _run_lossy(ctx, lossy_decisions, "claude->pi")
 
@@ -2279,6 +2389,12 @@ def run_pi_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
             f"defaultThinkingLevel → effortLevel={mapped}")
     if changed:
         write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+    mcp = pi_read_mcp(ctx.src_root, ctx.report)
+    if mcp:
+        claude_write_mcp(ctx, mcp)
+        for name in mcp:
+            ctx.report.migrated_clean.append(
+                f"mcp.json:{name} → {claude_mcp_path(ctx).name}:mcpServers.{name}")
     pi_report_unmappables(ctx, settings)
 
     _run_lossy(ctx, lossy_decisions, "pi->claude")
@@ -2322,16 +2438,23 @@ def run_codex_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
                 "equivalent)")
     if updates:
         pi_update_settings(ctx, updates)
+    mcp = cfg.get("mcp_servers") or {}
+    if mcp:
+        pi_write_mcp(ctx, {n: _native_mcp_from_codex(n, s) for n, s in mcp.items()})
 
     _pi_feature_gap_notes(
         ctx,
-        mcp=bool(cfg.get("mcp_servers")),
         agents=(ctx.src_root / "agents").is_dir()
         and any((ctx.src_root / "agents").glob("*.toml")),
         hooks=bool(cfg.get("notify") or codex_read_hooks(ctx.src_root)),
         permissions=(ctx.src_root / "rules").is_dir()
         or any(k in cfg for k in ("sandbox_mode", "approval_policy")),
     )
+    report_unhandled_keys(
+        ctx, cfg,
+        ("model", "model_reasoning_effort", "mcp_servers", "notify", "hooks",
+         "sandbox_mode", "approval_policy", "sandbox_workspace_write"),
+        "config.toml", "no pi equivalent")
 
     _run_lossy(ctx, lossy_decisions, "codex->pi")
 
@@ -2364,6 +2487,13 @@ def run_pi_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         changed = True
         ctx.report.migrated_clean.append(
             f"defaultThinkingLevel → model_reasoning_effort={mapped}")
+    for name, spec in pi_read_mcp(ctx.src_root, ctx.report).items():
+        t = _normalize_mcp_claude_to_codex(name, spec, ctx.report)
+        if t is not None:
+            existing.setdefault("mcp_servers", {})[name] = t
+            changed = True
+            ctx.report.migrated_clean.append(
+                f"mcp.json:{name} → [mcp_servers.{name}]")
     if changed:
         write_text(ctx, dst, render_toml(existing))
     pi_report_unmappables(ctx, settings)
@@ -2398,9 +2528,11 @@ def run_cursor_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         ctx.report.notes.append(
             "defaultProvider was not set (Cursor doesn't record one) — "
             "set it in ~/.pi/agent/settings.json if needed")
+    mcp = cursor_read_mcp(ctx.src_root)
+    if mcp:
+        pi_write_mcp(ctx, mcp)
     _pi_feature_gap_notes(
         ctx,
-        mcp=bool(cursor_read_mcp(ctx.src_root)),
         agents=(ctx.src_root / "agents").is_dir()
         and any((ctx.src_root / "agents").rglob("*.md")),
         hooks=bool(load_json(ctx.src_root / "hooks.json").get("hooks")),
@@ -2425,6 +2557,11 @@ def run_pi_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
                 f"AGENTS.md → {len(rules)} cursor rule file(s)")
     tier_a_commands_to_cursor_skills(ctx, "prompts", "prompts")
     skills_from_pi(ctx)
+    mcp = pi_read_mcp(ctx.src_root, ctx.report)
+    if mcp:
+        out = {n: _normalize_mcp_for_cursor(s) for n, s in mcp.items()}
+        cursor_write_mcp(out, ctx.dst_root, ctx)
+        ctx.report.migrated_clean.append(_cursor_label_mcp("→ cursor mcp.json", out))
 
     settings = load_pi_settings(ctx.src_root)
     level = _pi_effective_thinking_level(ctx, settings)
@@ -2467,9 +2604,11 @@ def run_opencode_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         pi_update_settings(ctx, updates)
         ctx.report.migrated_clean.append(
             "opencode.json:model → defaultProvider/defaultModel")
+    mcp = opencode_read_mcp(ctx.src_root)
+    if mcp:
+        pi_write_mcp(ctx, mcp)
     _pi_feature_gap_notes(
         ctx,
-        mcp=bool(cfg.get("mcp")),
         agents=any(_opencode_subdirs(ctx.src_root, "agents")),
         permissions=bool(cfg.get("permission")),
     )
@@ -2500,9 +2639,664 @@ def run_pi_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         ctx.report.skipped_unmappable.append(
             "settings.json:defaultThinkingLevel/modelThinkingLevels "
             "(opencode has no reasoning-effort knob)")
+    mcp = pi_read_mcp(ctx.src_root, ctx.report)
+    if mcp:
+        opencode_write_mcp(ctx, mcp)
     pi_report_unmappables(ctx, settings)
 
     _run_lossy(ctx, lossy_decisions, "pi->opencode")
+
+
+# ============================================================================
+# agentty — I/O helpers
+# ============================================================================
+# agentty (agentty.xyz, agentty-xyz/agentty) is a terminal "ADE" that runs
+# Codex, Claude Code, Gemini CLI and Antigravity CLI as *backends* inside
+# per-session git worktrees. It has no instruction files, skills, MCP
+# servers, hooks or subagents of its own — every backend reads its native
+# config (~/.codex, ~/.claude, AGENTS.md/CLAUDE.md/GEMINI.md) — so the
+# migratable surface is the per-project model defaults agentty keeps in
+# SQLite (<root>/db/agentty.db; root = $AGENTTY_ROOT or ~/.agentty): for
+# each of the Smart/Fast/Review roles a backend ("agent"), a model id, a
+# reasoning level (low…max) and a speed (normal/fast). Only the Smart role
+# (new sessions) has a counterpart in the other tools. Rows are keyed by
+# registered project, so --scope project targets the project at cwd and
+# --scope user targets agentty's active project (named in the report).
+
+AGENTTY_DB = Path("db") / "agentty.db"
+AGENTTY_LOCK = Path("db") / "agentty.lock"
+AGENTTY_LEVELS = ("low", "medium", "high", "xhigh", "max")
+AGENTTY_AGENT_TO_PROVIDER = {"claude": "anthropic", "codex": "openai",
+                             "gemini": "google", "antigravity": "google"}
+AGENTTY_PROVIDER_TO_AGENT = {"anthropic": "claude", "openai": "codex",
+                             "google": "gemini"}
+# Model catalog as of agentty 0.17.0. An unknown id is still written (the
+# row doesn't care) but agentty falls back to its default, so it's flagged.
+AGENTTY_MODELS = {
+    "claude": ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5",
+               "claude-haiku-4-5-20251001"),
+    "codex": ("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra",
+              "gpt-5.3-codex-spark"),
+    "gemini": ("gemini-3.1-pro-preview", "gemini-3.8-flash",
+               "gemini-3.5-flash-lite"),
+}
+AGENTTY_MODELS["antigravity"] = AGENTTY_MODELS["gemini"]
+AGENTTY_SMART_KEYS = {
+    "agent": "DefaultSmartAgent", "model": "DefaultSmartModel",
+    "level": "DefaultSmartReasoningLevel", "speed": "DefaultSmartSpeedMode",
+}
+AGENTTY_OTHER_ROLE_KEYS = (
+    "DefaultFastAgent", "DefaultFastModel", "DefaultFastReasoningLevel",
+    "DefaultFastSpeedMode", "DefaultReviewAgent", "DefaultReviewModel",
+    "DefaultReviewReasoningLevel", "DefaultReviewSpeedMode",
+)
+# Into agentty's low…max scale: Codex `ultra` collapses, `none` has no
+# meaning (agentty always reasons); pi `off` likewise.
+CODEX_EFFORT_TO_AGENTTY = {
+    "minimal": "low", "low": "low", "medium": "medium", "high": "high",
+    "xhigh": "xhigh", "max": "max", "ultra": "max",
+}
+PI_THINKING_TO_AGENTTY = {
+    "minimal": "low", "low": "low", "medium": "medium", "high": "high",
+    "xhigh": "xhigh", "max": "max",
+}
+
+
+def agentty_db_path(root: Path) -> Path:
+    return root / AGENTTY_DB
+
+
+def _agentty_project_cwd(doc: Path | None) -> Path | None:
+    """Project scope hands the runner <project>/AGENTS.md as the doc; user
+    scope hands None. That is the only scope signal a runner gets."""
+    return doc.parent if doc else None
+
+
+def _agentty_locked(root: Path) -> bool:
+    """A running agentty holds flock() on db/agentty.lock (Rust's
+    File::try_lock). Probe it the same way so we never write under a live
+    instance, whose in-memory settings would overwrite ours on exit."""
+    lock = root / AGENTTY_LOCK
+    if not lock.exists():
+        return False
+    try:
+        import fcntl
+    except ImportError:  # Windows: no cheap probe; the busy timeout has to do
+        return False
+    try:
+        with open(lock, "r+") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
+
+
+def _agentty_connect(root: Path) -> sqlite3.Connection | None:
+    """Read-only connection (never creates a database), or None when
+    agentty has not been run under this root yet."""
+    db = agentty_db_path(root)
+    if not db.exists():
+        return None
+    return sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+
+
+def agentty_find_project(root: Path, cwd: Path | None) -> tuple[int, str] | None:
+    """(id, path) of the registered project containing `cwd`, or of the
+    active project when `cwd` is None (user scope)."""
+    con = _agentty_connect(root)
+    if con is None:
+        return None
+    try:
+        if cwd is None:
+            row = con.execute(
+                "SELECT value FROM setting WHERE name = 'ActiveProjectId'"
+            ).fetchone()
+            if not row:
+                return None
+            hit = con.execute("SELECT id, path FROM project WHERE id = ?",
+                              (int(row[0]),)).fetchone()
+            return (hit[0], hit[1]) if hit else None
+        projects = {os.path.realpath(path): (pid, path)
+                    for pid, path in con.execute("SELECT id, path FROM project")}
+        probe = Path(os.path.realpath(cwd))
+        for candidate in (probe, *probe.parents):
+            if str(candidate) in projects:
+                return projects[str(candidate)]
+        return None
+    except (sqlite3.Error, ValueError):
+        return None
+    finally:
+        con.close()
+
+
+def agentty_read_project_settings(root: Path, project_id: int) -> dict[str, str]:
+    con = _agentty_connect(root)
+    if con is None:
+        return {}
+    try:
+        return {name: value for name, value in con.execute(
+            "SELECT name, value FROM project_setting WHERE project_id = ?",
+            (project_id,))}
+    except sqlite3.Error:
+        return {}
+    finally:
+        con.close()
+
+
+def agentty_source_defaults(ctx: Ctx) -> dict[str, str] | None:
+    """Smart-role defaults of the project this migration is about, as
+    {agent, model, level, speed} (absent keys unset); None when agentty
+    has no usable project. Other roles and agentty-only rows are reported
+    on the way so nothing disappears silently."""
+    root = ctx.src_root
+    if not agentty_db_path(root).exists():
+        ctx.report.notes.append(
+            f"no {AGENTTY_DB} under {root} — agentty has not been run, so "
+            "there are no model defaults to migrate")
+        return None
+    target = agentty_find_project(root, _agentty_project_cwd(ctx.src_doc))
+    if target is None:
+        ctx.report.notes.append(
+            "agentty has no registered project for this scope (open the "
+            "project in agentty first) — no model defaults to migrate")
+        return None
+    project_id, path = target
+    rows = agentty_read_project_settings(root, project_id)
+    ctx.report.notes.append(f"agentty model defaults read from project {path}")
+    smart = {k: rows[key] for k, key in AGENTTY_SMART_KEYS.items() if rows.get(key)}
+    if smart.get("level") and smart["level"] not in AGENTTY_LEVELS:
+        ctx.report.skipped_unmappable.append(
+            f"DefaultSmartReasoningLevel={smart['level']!r} (unknown agentty "
+            "level)")
+        smart.pop("level")
+    other_roles = [k for k in AGENTTY_OTHER_ROLE_KEYS if k in rows]
+    if other_roles:
+        ctx.report.skipped_unmappable.append(
+            "agentty Fast/Review role defaults (" + ", ".join(other_roles)
+            + ") — no destination has per-role models")
+    known = set(AGENTTY_SMART_KEYS.values()) | set(AGENTTY_OTHER_ROLE_KEYS)
+    for key in sorted(rows):
+        if key not in known:
+            ctx.report.skipped_unmappable.append(
+                f"agentty project setting {key} (agentty-only — no equivalent)")
+    return smart
+
+
+def agentty_write_defaults(ctx: Ctx, values: dict[str, str | None]) -> bool:
+    """Upsert Smart-role rows for the target project. The plan/dry-run
+    passes only record the database (so it gets backed up); the apply pass
+    refuses to touch a database a running agentty holds. Returns True when
+    the rows were written (or planned)."""
+    root = ctx.dst_root
+    db = agentty_db_path(root)
+    rows = {AGENTTY_SMART_KEYS[k]: v for k, v in values.items() if v}
+    if not rows:
+        return False
+    if not db.exists():
+        ctx.report.skipped_unmappable.append(
+            f"model defaults (no {AGENTTY_DB} under {root} — start agentty "
+            "once so it creates its database, then rerun)")
+        return False
+    target = agentty_find_project(root, _agentty_project_cwd(ctx.dst_doc))
+    if target is None:
+        ctx.report.skipped_unmappable.append(
+            "model defaults (agentty has no registered project for this "
+            "scope — open the project in agentty first, then rerun)")
+        return False
+    project_id, path = target
+    ctx.report.notes.append(f"agentty model defaults written to project {path}")
+    if ctx.plan_mode or ctx.dry_run:
+        ctx.planned_writes.add(db)
+        wal = db.with_name(db.name + "-wal")
+        if wal.exists():
+            ctx.planned_writes.add(wal)
+        if ctx.dry_run and not ctx.plan_mode:
+            print(f"[dry-run] update {db}: {', '.join(rows)}")
+        return True
+    if _agentty_locked(root):
+        ctx.report.skipped_unmappable.append(
+            "model defaults (agentty is running — close it and rerun)")
+        return False
+    try:
+        con = sqlite3.connect(str(db), timeout=5)
+        try:
+            with con:
+                con.executemany(
+                    "INSERT OR REPLACE INTO project_setting "
+                    "(project_id, name, value) VALUES (?, ?, ?)",
+                    [(project_id, name, value) for name, value in rows.items()])
+            # Fold the WAL into the main file so the plain-file backup and
+            # --restore see one coherent database.
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        ctx.report.skipped_unmappable.append(
+            f"model defaults (could not write {AGENTTY_DB}: {exc})")
+        return False
+    return True
+
+
+def _agentty_agent_for_model(model: str) -> str | None:
+    """Infer the agentty backend from a bare model id (Cursor records no
+    provider): claude-* → claude, gpt-*/o-series → codex, gemini-* → gemini."""
+    m = model.lower()
+    if m.startswith("claude"):
+        return "claude"
+    if m.startswith(("gpt", "o1", "o3", "o4", "codex")):
+        return "codex"
+    if m.startswith("gemini"):
+        return "gemini"
+    return None
+
+
+def _agentty_store(ctx: Ctx, agent: str | None, model: str | None,
+                   level: str | None, speed: str | None,
+                   labels: list[str]) -> None:
+    """Write whatever Smart-role pieces the source provided; the labels
+    land in the report only once the rows are actually written/planned."""
+    if model and agent and model not in AGENTTY_MODELS.get(agent, ()):
+        ctx.report.notes.append(
+            f"model {model!r} is not in agentty 0.17's {agent} catalog "
+            f"({', '.join(AGENTTY_MODELS[agent])}) — agentty will fall back "
+            "to its default until you pick one in Settings")
+    if agentty_write_defaults(
+            ctx, {"agent": agent, "model": model, "level": level, "speed": speed}):
+        ctx.report.migrated_clean.extend(labels)
+
+
+def _agentty_feature_notes(ctx: Ctx, present: list[str],
+                           backend: str | None) -> None:
+    """Skills, MCP, hooks, subagents, permissions, commands: agentty has
+    none of its own. From a tool agentty runs as a backend they already
+    apply (it launches that CLI with its own config); from any other tool
+    they need a migration to a backend instead."""
+    if not present:
+        return
+    if backend:
+        ctx.report.notes.append(
+            f"{', '.join(present)}: not agentty settings — agentty runs "
+            f"{backend} with its own config, where these already apply; to "
+            "use them with another backend, migrate to that tool directly")
+    else:
+        ctx.report.skipped_unmappable.append(
+            f"{', '.join(present)} (agentty has none of its own — it runs "
+            "Claude Code/Codex with their configs; migrate --to claude or "
+            "--to codex)")
+
+
+def _agentty_effort_out(ctx: Ctx, level: str, table: dict, dest: str) -> str | None:
+    mapped = table.get(level)
+    if mapped is None:
+        ctx.report.skipped_unmappable.append(
+            f"DefaultSmartReasoningLevel={level!r} (no {dest} equivalent)")
+    elif level == "max" and mapped != "max":
+        ctx.report.notes.append(
+            f"agentty reasoning level 'max' sits above {dest}'s scale — "
+            f"collapsed to {mapped}")
+    return mapped
+
+
+def _agentty_speed_note(ctx: Ctx, defaults: dict | None, dest: str) -> None:
+    if defaults and defaults.get("speed") == "fast":
+        ctx.report.skipped_unmappable.append(
+            f"DefaultSmartSpeedMode=fast ({dest} has no fast-mode setting)")
+
+
+def _agentty_model_note(ctx: Ctx, agent: str | None, dest_agent: str,
+                        dest: str) -> None:
+    if agent and agent != dest_agent:
+        ctx.report.notes.append(
+            f"agentty's default model belongs to its {agent} backend — "
+            f"verify {dest} can run it")
+
+
+def _agentty_src_doc(ctx: Ctx) -> Path:
+    return (ctx.src_doc if ctx.src_doc and ctx.src_doc.exists()
+            else ctx.src_root / "AGENTS.md")
+
+
+_AGENTTY_SAME_FILE = ("AGENTS.md at the project root is read natively by "
+                      "both tools — no translation needed")
+
+
+# ---- agentty → others --------------------------------------------------------
+
+def run_agentty_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    tier_a_docs_codex_to_claude(ctx)  # project AGENTS.md → CLAUDE.md (native note)
+    d = agentty_source_defaults(ctx)
+    if d:
+        dst = ctx.dst_root / "settings.json"
+        existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+        changed = False
+        if d.get("model"):
+            existing["model"] = d["model"]
+            changed = True
+            ctx.report.migrated_clean.append("DefaultSmartModel → settings.json:model")
+            _agentty_model_note(ctx, d.get("agent"), "claude", "Claude Code")
+        if d.get("level"):
+            mapped = _agentty_effort_out(ctx, d["level"], EFFORT_C2X, "Claude Code")
+            if mapped:
+                existing["effortLevel"] = mapped
+                changed = True
+                ctx.report.migrated_clean.append(
+                    f"DefaultSmartReasoningLevel={d['level']} → effortLevel={mapped}")
+        if d.get("speed") == "fast":
+            if d.get("agent") == "claude":
+                existing["fastMode"] = True
+                changed = True
+                ctx.report.migrated_clean.append(
+                    "DefaultSmartSpeedMode=fast → fastMode=true")
+            else:
+                ctx.report.notes.append(
+                    "DefaultSmartSpeedMode=fast belongs to a non-Claude "
+                    "backend — fastMode left unset")
+        if changed:
+            write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+    _run_lossy(ctx, lossy_decisions, "agentty->claude")
+
+
+def run_agentty_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    copy_instruction_doc(ctx, _agentty_src_doc(ctx),
+                         ctx.dst_doc or (ctx.dst_root / "AGENTS.md"),
+                         _AGENTTY_SAME_FILE)
+    d = agentty_source_defaults(ctx)
+    if d:
+        dst = ctx.dst_root / "config.toml"
+        existing = load_toml(dst) if (ctx.merge and dst.exists()) else {}
+        changed = False
+        if d.get("model"):
+            existing["model"] = d["model"]
+            changed = True
+            ctx.report.migrated_clean.append("DefaultSmartModel → config.toml:model")
+            _agentty_model_note(ctx, d.get("agent"), "codex", "Codex")
+        if d.get("level"):  # agentty's five levels all exist in Codex
+            existing["model_reasoning_effort"] = d["level"]
+            changed = True
+            ctx.report.migrated_clean.append(
+                f"DefaultSmartReasoningLevel={d['level']} → model_reasoning_effort")
+        if d.get("speed") == "fast":
+            if d.get("agent") == "codex":
+                existing["service_tier"] = "fast"
+                existing.setdefault("features", {})["fast_mode"] = True
+                changed = True
+                ctx.report.migrated_clean.append(
+                    'DefaultSmartSpeedMode=fast → service_tier="fast" + '
+                    "[features] fast_mode")
+            else:
+                ctx.report.notes.append(
+                    "DefaultSmartSpeedMode=fast belongs to a non-Codex "
+                    "backend — service_tier left unset")
+        if changed:
+            write_text(ctx, dst, render_toml(existing))
+    _run_lossy(ctx, lossy_decisions, "agentty->codex")
+
+
+def run_agentty_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = _agentty_src_doc(ctx)
+    project_root = cursor_project_root_from(ctx.dst_root)
+    if (project_root and src_doc.exists()
+            and src_doc == project_root / "AGENTS.md"):
+        ctx.report.notes.append(
+            "AGENTS.md at the project root is read natively by Cursor — "
+            "no translation needed")
+    elif src_doc.exists():
+        rules = doc_to_cursor_rules(src_doc.read_text(encoding="utf-8"))
+        if rules:
+            cursor_write_rules(rules, ctx.dst_root, ctx)
+            ctx.report.migrated_clean.append(
+                f"AGENTS.md → {len(rules)} cursor rule file(s)")
+    d = agentty_source_defaults(ctx)
+    if d and d.get("model"):
+        effort = (cursor_effort_from(ctx, d["level"], "DefaultSmartReasoningLevel")
+                  if d.get("level") else None)
+        cursor_cli_config_write_model(ctx, d["model"], effort)
+        ctx.report.migrated_clean.append(
+            "DefaultSmartModel → cli-config.json:model"
+            + (f" (effort={effort})" if effort else ""))
+    elif d and d.get("level"):
+        ctx.report.skipped_unmappable.append(
+            "DefaultSmartReasoningLevel (Cursor stores effort per model — "
+            "agentty has no default model set)")
+    _agentty_speed_note(ctx, d, "Cursor")
+    _run_lossy(ctx, lossy_decisions, "agentty->cursor")
+
+
+def run_agentty_to_opencode(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    opencode_docs_note_or_copy(ctx, _agentty_src_doc(ctx))
+    d = agentty_source_defaults(ctx)
+    if d and d.get("model"):
+        provider = AGENTTY_AGENT_TO_PROVIDER.get(d.get("agent") or "")
+        model = f"{provider}/{d['model']}" if provider else d["model"]
+        opencode_update_config(ctx, {"model": model})
+        ctx.report.migrated_clean.append(
+            f"DefaultSmartAgent/DefaultSmartModel → opencode.json:model={model}")
+        if not provider:
+            ctx.report.notes.append(
+                "opencode model ids are provider-qualified — check "
+                f"`{model}` resolves")
+    if d and d.get("level"):
+        ctx.report.skipped_unmappable.append(
+            "DefaultSmartReasoningLevel (opencode has no reasoning-effort knob)")
+    _agentty_speed_note(ctx, d, "opencode")
+    _run_lossy(ctx, lossy_decisions, "agentty->opencode")
+
+
+def run_agentty_to_pi(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    dst_doc = ctx.dst_doc or (ctx.dst_root / "AGENTS.md")
+    copy_instruction_doc(ctx, _agentty_src_doc(ctx), dst_doc, _AGENTTY_SAME_FILE)
+    _pi_note_override_shadow(ctx, dst_doc)
+    d = agentty_source_defaults(ctx)
+    updates: dict = {}
+    if d and d.get("model"):
+        updates["defaultModel"] = d["model"]
+        provider = AGENTTY_AGENT_TO_PROVIDER.get(d.get("agent") or "")
+        if provider:
+            updates["defaultProvider"] = provider
+        else:
+            ctx.report.notes.append(
+                "defaultProvider was not set (agentty has no backend "
+                "recorded) — set it in ~/.pi/agent/settings.json if needed")
+    if d and d.get("level"):  # pi's scale has all five agentty levels
+        updates["defaultThinkingLevel"] = d["level"]
+    if updates:
+        pi_update_settings(ctx, updates)
+        ctx.report.migrated_clean.append(
+            "agentty Smart defaults → " + "/".join(sorted(updates)))
+    _agentty_speed_note(ctx, d, "pi")
+    _run_lossy(ctx, lossy_decisions, "agentty->pi")
+
+
+# ---- others → agentty --------------------------------------------------------
+
+def _present_dirs(root: Path, pairs: tuple[tuple[str, str], ...]) -> list[str]:
+    return [label for sub, label in pairs
+            if (root / sub).is_dir() and any((root / sub).iterdir())]
+
+
+def run_claude_to_agentty(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    settings = load_claude_settings(ctx.src_root)
+    if ctx.dst_doc:
+        # <project>/CLAUDE.md (+rules/outputStyle) → <project>/AGENTS.md so
+        # the Codex and Antigravity backends get the same guidance; the
+        # Claude backend keeps reading CLAUDE.md itself.
+        tier_a_docs_claude_to_codex(ctx)
+        ctx.report.notes.append(
+            "agentty's Claude backend reads CLAUDE.md natively; the "
+            "AGENTS.md copy serves its Codex/Antigravity backends (agentty "
+            "suggests symlinking CLAUDE.md and GEMINI.md to one AGENTS.md)")
+    model = settings.get("model") if isinstance(settings.get("model"), str) else None
+    effort = settings.get("effortLevel")
+    level = EFFORT_C2X.get(effort) if isinstance(effort, str) else None
+    speed = "fast" if settings.get("fastMode") is True else None
+    labels: list[str] = []
+    if model:
+        labels.append("settings.json:model → DefaultSmartAgent=claude + DefaultSmartModel")
+    if level:
+        labels.append(f"effortLevel={effort} → DefaultSmartReasoningLevel={level}")
+    if speed:
+        labels.append("fastMode=true → DefaultSmartSpeedMode=fast")
+    if labels:
+        _agentty_store(ctx, "claude" if model else None, model, level, speed, labels)
+    present = _present_dirs(ctx.src_root, (
+        ("skills", "skills"), ("commands", "slash commands"),
+        ("agents", "subagents")))
+    if claude_read_mcp(ctx):
+        present.append("MCP servers")
+    present += [k for k in ("hooks", "permissions") if settings.get(k)]
+    _agentty_feature_notes(ctx, present, "Claude Code")
+    _run_lossy(ctx, lossy_decisions, "claude->agentty")
+
+
+def run_codex_to_agentty(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    if ctx.dst_doc:
+        copy_instruction_doc(ctx, _agentty_src_doc(ctx), ctx.dst_doc, _AGENTTY_SAME_FILE)
+    cfg = load_toml(ctx.src_root / "config.toml")
+    model = cfg.get("model") if isinstance(cfg.get("model"), str) else None
+    effort = cfg.get("model_reasoning_effort")
+    level = CODEX_EFFORT_TO_AGENTTY.get(effort) if isinstance(effort, str) else None
+    if isinstance(effort, str) and not level:
+        ctx.report.skipped_unmappable.append(
+            f"model_reasoning_effort={effort!r} (no agentty reasoning level)")
+    if effort == "ultra":
+        ctx.report.notes.append(
+            "Codex effort 'ultra' has no agentty tier — mapped to its "
+            "highest level 'max'")
+    speed = "fast" if cfg.get("service_tier") == "fast" else None
+    labels: list[str] = []
+    if model:
+        labels.append("config.toml:model → DefaultSmartAgent=codex + DefaultSmartModel")
+    if level:
+        labels.append(f"model_reasoning_effort={effort} → DefaultSmartReasoningLevel={level}")
+    if speed:
+        labels.append('service_tier="fast" → DefaultSmartSpeedMode=fast')
+    if labels:
+        _agentty_store(ctx, "codex" if model else None, model, level, speed, labels)
+    present = _present_dirs(ctx.src_root, (
+        ("skills", "skills"), ("prompts", "custom prompts"),
+        ("agents", "custom agents"), ("rules", "execpolicy rules")))
+    if cfg.get("mcp_servers"):
+        present.append("MCP servers")
+    if cfg.get("notify") or cfg.get("hooks") or codex_read_hooks(ctx.src_root):
+        present.append("hooks")
+    if any(k in cfg for k in ("sandbox_mode", "approval_policy")):
+        present.append("sandbox/approval policy")
+    _agentty_feature_notes(ctx, present, "Codex")
+    _run_lossy(ctx, lossy_decisions, "codex->agentty")
+
+
+def run_cursor_to_agentty(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    rules = cursor_read_rules(ctx.src_root)
+    if rules and ctx.dst_doc:
+        doc = cursor_rules_to_doc(rules)
+        if ctx.dst_doc.exists() and ctx.merge:
+            doc = ctx.dst_doc.read_text(encoding="utf-8").rstrip() + "\n\n" + doc
+        write_text(ctx, ctx.dst_doc, doc + "\n")
+        ctx.report.migrated_clean.append(
+            f"{len(rules)} cursor rule(s) → {ctx.dst_doc.name}")
+    elif rules:
+        ctx.report.notes.append(
+            "cursor rules are project files — rerun with --scope project "
+            "to fold them into the project's AGENTS.md")
+    model = cursor_cli_config_read_model(ctx.src_root)
+    agent = _agentty_agent_for_model(model) if model else None
+    if model and not agent:
+        ctx.report.notes.append(
+            f"could not infer which agentty backend runs {model!r} — pick "
+            "the agent in agentty's Settings")
+    effort = cursor_cli_config_read_effort(ctx.src_root)
+    level = effort if effort in AGENTTY_LEVELS else None
+    if effort and not level:
+        ctx.report.skipped_unmappable.append(
+            f"cli-config.json effort={effort!r} (no agentty reasoning level)")
+    labels: list[str] = []
+    if model:
+        labels.append("cli-config.json:model → DefaultSmartModel"
+                      + (f" (DefaultSmartAgent={agent})" if agent else ""))
+    if level:
+        labels.append(f"cli-config.json effort={effort} → DefaultSmartReasoningLevel")
+    if labels:
+        _agentty_store(ctx, agent, model, level, None, labels)
+    present = _present_dirs(ctx.src_root, (("skills", "skills"), ("agents", "subagents")))
+    if cursor_read_mcp(ctx.src_root):
+        present.append("MCP servers")
+    if load_json(ctx.src_root / "hooks.json").get("hooks"):
+        present.append("hooks")
+    _agentty_feature_notes(ctx, present, None)
+    _run_lossy(ctx, lossy_decisions, "cursor->agentty")
+
+
+def run_opencode_to_agentty(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    src_doc = ctx.src_root / "AGENTS.md"
+    project_src = _opencode_project_root(ctx.src_root)
+    if project_src and (project_src / "AGENTS.md").exists():
+        src_doc = project_src / "AGENTS.md"
+    if ctx.dst_doc:
+        copy_instruction_doc(ctx, src_doc, ctx.dst_doc, _AGENTTY_SAME_FILE)
+    cfg = load_opencode_config(ctx.src_root)
+    model = agent = None
+    if isinstance(cfg.get("model"), str):
+        model, provider = model_from_opencode(cfg["model"])
+        agent = (AGENTTY_PROVIDER_TO_AGENT.get(provider or "")
+                 or _agentty_agent_for_model(model))
+        if not agent:
+            ctx.report.notes.append(
+                f"provider {provider!r} is not an agentty backend — pick the "
+                "agent in agentty's Settings")
+    if model:
+        _agentty_store(ctx, agent, model, None, None, [
+            "opencode.json:model → DefaultSmartModel"
+            + (f" (DefaultSmartAgent={agent})" if agent else "")])
+    present = _present_dirs(ctx.src_root, (
+        ("skills", "skills"), ("commands", "slash commands"),
+        ("agents", "subagents")))
+    if cfg.get("mcp"):
+        present.append("MCP servers")
+    if cfg.get("permission"):
+        present.append("permissions")
+    _agentty_feature_notes(ctx, present, None)
+    _opencode_report_unmappables(ctx, cfg)
+    _run_lossy(ctx, lossy_decisions, "opencode->agentty")
+
+
+def run_pi_to_agentty(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    if ctx.dst_doc:
+        copy_instruction_doc(ctx, _pi_src_doc(ctx), ctx.dst_doc, _AGENTTY_SAME_FILE)
+    settings = load_pi_settings(ctx.src_root)
+    model = (settings["defaultModel"]
+             if isinstance(settings.get("defaultModel"), str) else None)
+    provider = settings.get("defaultProvider")
+    agent = AGENTTY_PROVIDER_TO_AGENT.get(provider or "") or (
+        _agentty_agent_for_model(model) if model else None)
+    if model and not agent:
+        ctx.report.notes.append(
+            f"provider {provider!r} is not an agentty backend — pick the "
+            "agent in agentty's Settings")
+    raw_level = _pi_effective_thinking_level(ctx, settings)
+    level = PI_THINKING_TO_AGENTTY.get(raw_level) if raw_level else None
+    if raw_level and not level:
+        ctx.report.skipped_unmappable.append(
+            f"settings.json:defaultThinkingLevel={raw_level!r} (no agentty "
+            "reasoning level)")
+    labels: list[str] = []
+    if model:
+        labels.append("defaultModel → DefaultSmartModel"
+                      + (f" (DefaultSmartAgent={agent})" if agent else ""))
+    if level:
+        labels.append(f"defaultThinkingLevel={raw_level} → DefaultSmartReasoningLevel={level}")
+    if labels:
+        _agentty_store(ctx, agent, model, level, None, labels)
+    present = _present_dirs(ctx.src_root, (
+        ("skills", "skills"), ("prompts", "prompt templates")))
+    if load_json(ctx.src_root / "mcp.json").get("mcpServers"):
+        present.append("MCP servers")
+    _agentty_feature_notes(ctx, present, None)
+    pi_report_unmappables(ctx, settings)
+    _run_lossy(ctx, lossy_decisions, "pi->agentty")
 
 
 # ============================================================================
@@ -2824,10 +3618,8 @@ def _skills_copy_from_opencode(ctx: Ctx) -> None:
 
 
 def _opencode_report_unmappables(ctx: Ctx, cfg: dict) -> None:
-    for k in OPENCODE_UNMAPPABLE_KEYS:
-        if k in cfg:
-            ctx.report.skipped_unmappable.append(
-                f"opencode.json:{k} (no equivalent — recreate by hand)")
+    report_unhandled_keys(ctx, cfg, OPENCODE_CONFIG_HANDLED, "opencode.json",
+                          "no equivalent — recreate by hand")
     if cfg.get("instructions"):
         ctx.report.notes.append(
             "opencode.json:instructions references extra instruction files "
@@ -4095,9 +4887,12 @@ def _apply_claude_agents_cursor(ctx: Ctx) -> None:
 # Cursor has a real hooks system (<cursor_root>/hooks.json, `version: 1`,
 # camelCase events, flat entry lists). A subset of events exists on both
 # sides; command-type hooks translate, everything else is dropped with a
-# note. Claude matchers have no Cursor equivalent in the translated shape,
-# and Cursor's prompt-type / shell-interception hooks have no Claude
-# equivalent, so both directions are Tier B.
+# note. Cursor CLI 2026.10 added per-hook `matcher` regexes, but they match
+# tool *types* (Shell, Write, MCP:<tool>) where Claude's match tool names
+# (Bash, Edit, mcp__server__tool), so only plain tool-name matchers on the
+# tool events translate. Cursor's prompt-type / shell-interception hooks
+# and its `failClosed`/`loop_limit` knobs have no Claude equivalent, so
+# both directions stay Tier B.
 
 HOOK_EVENTS_CLAUDE_TO_CURSOR = {
     "PreToolUse": "preToolUse",
@@ -4113,6 +4908,39 @@ HOOK_EVENTS_CLAUDE_TO_CURSOR = {
 }
 HOOK_EVENTS_CURSOR_TO_CLAUDE = {v: k for k, v in
                                 HOOK_EVENTS_CLAUDE_TO_CURSOR.items()}
+_TOOL_MATCHER_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure")
+_TOOL_NAME_CLAUDE_TO_CURSOR = {
+    "Bash": "Shell", "Read": "Read", "Write": "Write", "Edit": "Write",
+    "MultiEdit": "Write", "NotebookEdit": "Write", "Grep": "Grep",
+    "Task": "Task",
+}
+_TOOL_NAME_CURSOR_TO_CLAUDE = {
+    "Shell": "Bash", "Read": "Read", "Write": "Write|Edit", "Grep": "Grep",
+    "Task": "Task",
+}
+
+
+def _translate_tool_matcher(matcher: str, to_cursor: bool) -> str | None:
+    """Carry a `|`-list of plain tool names across the Claude/Cursor
+    vocabulary (incl. `mcp__srv__tool` ↔ `MCP:tool`). None when any part
+    is a real regex or an unknown tool, so the caller drops it with a
+    note rather than emit a matcher that silently never fires."""
+    if matcher.strip() in ("", "*"):
+        return "*"
+    table = _TOOL_NAME_CLAUDE_TO_CURSOR if to_cursor else _TOOL_NAME_CURSOR_TO_CLAUDE
+    mcp_re = r"mcp__[\w-]+__([\w-]+)" if to_cursor else r"MCP:([\w-]+)"
+    out: list[str] = []
+    for part in matcher.split("|"):
+        part = part.strip()
+        mcp = re.fullmatch(mcp_re, part)
+        if mcp:
+            out.append(f"MCP:{mcp.group(1)}" if to_cursor
+                       else f"mcp__.*__{mcp.group(1)}")
+        elif part in table:
+            out.append(table[part])
+        else:
+            return None
+    return "|".join(dict.fromkeys(out))
 
 
 def _detect_claude_hooks_cursor(ctx: Ctx) -> bool:
@@ -4146,15 +4974,22 @@ def _apply_claude_hooks_cursor(ctx: Ctx) -> None:
         for grp in groups if isinstance(groups, list) else []:
             if not isinstance(grp, dict):
                 continue
+            matcher = None
             if grp.get("matcher"):
-                ctx.report.notes.append(
-                    f"hooks.{event}: matcher {grp['matcher']!r} dropped "
-                    "(Cursor hook matchers work differently — review)")
+                if event in _TOOL_MATCHER_EVENTS:
+                    matcher = _translate_tool_matcher(str(grp["matcher"]), True)
+                if matcher is None:
+                    ctx.report.notes.append(
+                        f"hooks.{event}: matcher {grp['matcher']!r} dropped "
+                        "(Cursor matchers name tool types / subagent types "
+                        "— review)")
             for h in grp.get("hooks") or []:
                 if h.get("type") == "command" and h.get("command"):
                     entry: dict[str, Any] = {"command": h["command"]}
                     if h.get("timeout"):
                         entry["timeout"] = h["timeout"]
+                    if matcher and matcher != "*":
+                        entry["matcher"] = matcher
                     out.setdefault(cursor_event, []).append(entry)
                     migrated += 1
                 else:
@@ -4204,7 +5039,23 @@ def _apply_cursor_hooks(ctx: Ctx) -> None:
             h: dict[str, Any] = {"type": "command", "command": e["command"]}
             if e.get("timeout"):
                 h["timeout"] = e["timeout"]
-            out.setdefault(claude_event, []).append({"hooks": [h]})
+            group: dict[str, Any] = {"hooks": [h]}
+            matcher = e.get("matcher")
+            if matcher and matcher != "*":
+                translated = (_translate_tool_matcher(str(matcher), False)
+                              if claude_event in _TOOL_MATCHER_EVENTS else None)
+                if translated:
+                    group["matcher"] = translated
+                else:
+                    ctx.report.notes.append(
+                        f"hooks.json:{event}: matcher {matcher!r} dropped "
+                        "(no Claude tool-name equivalent — review)")
+            for knob in ("failClosed", "loop_limit"):
+                if knob in e:
+                    ctx.report.notes.append(
+                        f"hooks.json:{event}: {knob} dropped (Claude hooks "
+                        "have no equivalent)")
+            out.setdefault(claude_event, []).append(group)
             migrated += 1
     if migrated:
         write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
@@ -4606,6 +5457,8 @@ def preflight(ctx: Ctx, direction_key: str,
             or (ctx.src_root / "config.toml").exists() \
             or any(p.exists() for p in opencode_config_paths(ctx.src_root)):
         a_items.append("model + mcpServers + env + reasoning effort")
+    if agentty_db_path(ctx.src_root).exists():
+        a_items.append("agentty project model defaults (db/agentty.db)")
     for x in a_items:
         print(f"  ✓ {x}")
     if not a_items:
@@ -4699,6 +5552,16 @@ RUNNERS: dict[tuple[str, str], Callable[[Ctx, dict[str, bool]], None]] = {
     ("pi", "cursor"):   run_pi_to_cursor,
     ("opencode", "pi"): run_opencode_to_pi,
     ("pi", "opencode"): run_pi_to_opencode,
+    ("agentty", "claude"):   run_agentty_to_claude,
+    ("claude", "agentty"):   run_claude_to_agentty,
+    ("agentty", "codex"):    run_agentty_to_codex,
+    ("codex", "agentty"):    run_codex_to_agentty,
+    ("agentty", "cursor"):   run_agentty_to_cursor,
+    ("cursor", "agentty"):   run_cursor_to_agentty,
+    ("agentty", "opencode"): run_agentty_to_opencode,
+    ("opencode", "agentty"): run_opencode_to_agentty,
+    ("agentty", "pi"):       run_agentty_to_pi,
+    ("pi", "agentty"):       run_pi_to_agentty,
 }
 
 
@@ -4807,18 +5670,21 @@ def restore_from_backup(backup_path: Path, interactive: bool,
     return 0
 
 
-TOOLS = ("claude", "codex", "cursor", "opencode", "pi")
+TOOLS = ("claude", "codex", "cursor", "opencode", "pi", "agentty")
 
 
 def _tool_user_root(tool: str) -> Path:
     """User-scope config root. opencode is the XDG outlier
-    (~/.config/opencode) and pi nests under ~/.pi/agent; everything else
-    is a home dot-dir."""
+    (~/.config/opencode), pi nests under ~/.pi/agent, agentty honours its
+    own $AGENTTY_ROOT override; everything else is a home dot-dir."""
     home = Path.home()
     if tool == "opencode":
         return home / ".config" / "opencode"
     if tool == "pi":
         return home / ".pi" / "agent"
+    if tool == "agentty":
+        override = os.environ.get("AGENTTY_ROOT")
+        return Path(override).expanduser() if override else home / ".agentty"
     return home / f".{tool}"
 
 
@@ -4835,6 +5701,11 @@ def _tool_paths(tool: str, scope: str, override_dir: str | None) -> dict:
     cwd = Path.cwd()
     if scope == "user":
         return {"root": _tool_user_root(tool), "doc": None}
+    if tool == "agentty":
+        # agentty keeps project settings in its user-level database, keyed
+        # by project path; the project's own file is the AGENTS.md its
+        # backends read. The doc is also how runners learn the scope.
+        return {"root": _tool_user_root(tool), "doc": cwd / "AGENTS.md"}
     project_docs = {
         "claude": cwd / "CLAUDE.md",
         "codex": cwd / "AGENTS.md",
@@ -4876,6 +5747,7 @@ def main() -> int:
     ap.add_argument("--cursor-dir")
     ap.add_argument("--opencode-dir")
     ap.add_argument("--pi-dir")
+    ap.add_argument("--agentty-dir")
     ap.add_argument("--dry-run", action="store_true")
     mg = ap.add_mutually_exclusive_group()
     mg.add_argument("--merge", dest="merge", action="store_true", default=True)
@@ -4907,7 +5779,7 @@ def main() -> int:
             if not backup_path:
                 print("No backups found under any tool's backups dir "
                       "(~/.claude, ~/.codex, ~/.cursor, ~/.config/opencode, "
-                      "or ./.<tool>).", file=sys.stderr)
+                      "~/.pi/agent, ~/.agentty, or ./.<tool>).", file=sys.stderr)
                 return 1
             print(f"Using latest backup: {backup_path}")
         else:
@@ -4940,6 +5812,7 @@ def main() -> int:
         "cursor": args.cursor_dir,
         "opencode": args.opencode_dir,
         "pi": args.pi_dir,
+        "agentty": args.agentty_dir,
     }
     scopes = ["user", "project"] if args.scope == "both" else [args.scope]
 
@@ -4950,7 +5823,8 @@ def main() -> int:
         src_doc, dst_doc = src["doc"], dst["doc"]
 
         pretty = {"claude": "Claude Code", "codex": "Codex CLI",
-                  "cursor": "Cursor", "opencode": "opencode", "pi": "pi"}
+                  "cursor": "Cursor", "opencode": "opencode", "pi": "pi",
+                  "agentty": "agentty"}
         label = (f"{pretty[from_tool]} → {pretty[to_tool]} "
                  f"({src_root} → {dst_root})")
 

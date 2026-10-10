@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import io
+import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -381,7 +383,34 @@ class TierASettingsCodexToClaudeTests(FsTestBase):
         )
         m.tier_a_docs_codex_to_claude(ctx)
 
-        self.assertEqual((project / "CLAUDE.md").read_text(), "@AGENTS.md\n")
+        # Claude Code 2.1.277+ reads AGENTS.md itself when no CLAUDE.md
+        # exists — nothing is written, the report says why.
+        self.assertFalse((project / "CLAUDE.md").exists())
+        self.assertTrue(any("natively" in n for n in ctx.report.notes))
+
+        # An existing CLAUDE.md shadows AGENTS.md, so it gets the @import
+        # (once — rerunning must not duplicate it).
+        (project / "CLAUDE.md").write_text("# Mine\n")
+        for _ in range(2):
+            m.tier_a_docs_codex_to_claude(make_ctx(
+                codex, claude, src_doc=project / "AGENTS.md",
+                dst_doc=project / "CLAUDE.md"))
+        self.assertEqual((project / "CLAUDE.md").read_text(),
+                         "# Mine\n\n@AGENTS.md\n")
+
+    def test_developer_instructions_force_claude_md_with_import(self):
+        project = self.tmp / "project"
+        codex = project / ".codex"
+        codex.mkdir(parents=True)
+        (project / "AGENTS.md").write_text("# Guide\n")
+        (codex / "config.toml").write_text('developer_instructions = "Be terse."\n')
+        ctx = make_ctx(codex, project / ".claude",
+                       src_doc=project / "AGENTS.md",
+                       dst_doc=project / "CLAUDE.md")
+        m.tier_a_docs_codex_to_claude(ctx)
+        text = (project / "CLAUDE.md").read_text()
+        self.assertTrue(text.startswith("@AGENTS.md\n"))
+        self.assertIn("Be terse.", text)
 
 
 class CommandsRoundTripTests(FsTestBase):
@@ -1224,8 +1253,9 @@ class CursorHooksTests(FsTestBase):
         self.assertNotIn("notification", {k.lower() for k in data["hooks"]})
         self.assertTrue(any("Notification" in s
                             for s in ctx.report.skipped_unmappable))
-        # The matcher can't be represented — noted.
-        self.assertTrue(any("matcher" in n for n in ctx.report.notes))
+        # Cursor CLI 2026.10 matchers name tool *types*: Bash → Shell.
+        self.assertEqual(data["hooks"]["preToolUse"][0]["matcher"], "Shell")
+        self.assertFalse(any("matcher" in n for n in ctx.report.notes))
 
     def test_cursor_hooks_translate_to_claude_settings(self):
         (self.src / "hooks.json").write_text(json.dumps({
@@ -1591,9 +1621,11 @@ class PiRunnerTests(FsTestBase):
         # pi prompt templates share Claude's command frontmatter keys.
         _, fm = m.strip_frontmatter((self.dst / "prompts" / "ship.md").read_text())
         self.assertEqual(fm, {"description": "Ship", "argument-hint": "[env]"})
-        # pi has no MCP and no hooks — both reported.
+        # pi 0.99+ has MCP (mcp.json); it still has no hooks.
+        mcp = json.loads((self.dst / "mcp.json").read_text())
+        self.assertEqual(mcp["mcpServers"]["x"], {"command": "srv"})
         skipped = " ".join(ctx.report.skipped_unmappable)
-        self.assertIn("MCP", skipped)
+        self.assertNotIn("MCP", skipped)
         self.assertIn("hooks", skipped)
 
     def test_pi_to_claude_maps_thinking_and_provider(self):
@@ -2098,6 +2130,481 @@ class SeptemberSyncTests(FsTestBase):
         skipped = " ".join(ctx.report.skipped_unmappable)
         self.assertIn("tui", skipped)
         self.assertIn("default_agent", skipped)
+
+
+class OctoberSyncTests(FsTestBase):
+    """Mappings refreshed for the 2026-10 tool releases: Claude Code
+    2.1.296, Codex 0.162.1, Cursor CLI 2026.10.01, opencode 1.18.35, pi
+    1.1.0."""
+
+    # ---- fast mode is the same knob on Claude Code and Codex ---------------
+
+    def test_claude_fast_mode_reaches_codex_service_tier(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "model": "claude-opus-5-5", "fastMode": True}))
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_claude_to_codex(ctx)
+        cfg = tomllib.loads((self.dst / "config.toml").read_text())
+        self.assertEqual(cfg["service_tier"], "fast")
+        self.assertTrue(cfg["features"]["fast_mode"])
+
+    def test_codex_service_tier_fast_reaches_claude(self):
+        (self.src / "config.toml").write_text(
+            'service_tier = "fast"\n[features]\nfast_mode = true\n'
+            'web_search_request = true\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_codex_to_claude(ctx)
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertTrue(settings["fastMode"])
+        # Other feature flags have no Claude Code equivalent.
+        self.assertTrue(any("web_search_request" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_other_codex_service_tiers_are_reported(self):
+        (self.src / "config.toml").write_text('service_tier = "flex"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_codex_to_claude(ctx)
+        self.assertFalse((self.dst / "settings.json").exists())
+        self.assertTrue(any("service_tier" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    # ---- every unconsumed key is reported, no list to maintain -------------
+
+    def test_unknown_claude_settings_keys_are_reported(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "model": "claude-opus-5-5", "autoCompactWindow": 100000,
+            "deniedModels": ["x"], "permissions": {"allow": []}}))
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_claude_to_codex(ctx)
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        self.assertIn("autoCompactWindow", skipped)
+        self.assertIn("deniedModels", skipped)
+        # Consumed keys (mapped or Tier B) are not false positives.
+        self.assertNotIn("settings.json:model", skipped)
+        self.assertNotIn("settings.json:permissions", skipped)
+
+    def test_unknown_codex_config_keys_are_reported(self):
+        (self.src / "config.toml").write_text(
+            'model = "gpt-6.1-sol"\ndaybreak = true\n'
+            '[cloud]\nenabled = true\n[hooks]\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_codex_to_claude(ctx)
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        self.assertIn("daybreak", skipped)
+        self.assertIn("config.toml:cloud", skipped)
+        self.assertNotIn("config.toml:model ", skipped)
+        self.assertNotIn("config.toml:hooks", skipped)
+
+    def test_unknown_pi_and_opencode_keys_are_reported(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "defaultModel": "claude-opus-5-5", "cacheWarming": True,
+            "codemode": {"mode": "auto"}, "skills": ["~/x"]}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_claude(ctx, lossy_decisions={})
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        self.assertIn("cacheWarming", skipped)
+        self.assertIn("codemode", skipped)
+        self.assertIn("resource paths", skipped)
+        self.assertNotIn("settings.json:defaultModel", skipped)
+
+        shutil.rmtree(self.dst)
+        self.dst.mkdir()
+        (self.src / "opencode.json").write_text(json.dumps({
+            "model": "anthropic/claude-opus-5-5",
+            "agent": {"build": {"mode": "primary"}}}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_opencode_to_claude(ctx, lossy_decisions={})
+        self.assertTrue(any("opencode.json:agent" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    # ---- pi 0.99+ MCP ------------------------------------------------------
+
+    def test_pi_mcp_json_round_trips_with_claude(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "mcpServers": {
+                "fs": {"command": "npx", "args": ["-y", "fs"], "env": {"A": "1"}},
+                "docs": {"type": "http", "url": "https://d/mcp",
+                         "headers": {"Authorization": "Bearer x"}},
+                "old": {"type": "sse", "url": "https://old/sse"},
+            }}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_pi(ctx, lossy_decisions={})
+        mcp = json.loads((self.dst / "mcp.json").read_text())["mcpServers"]
+        self.assertEqual(mcp["fs"], {"command": "npx", "args": ["-y", "fs"],
+                                     "env": {"A": "1"}})
+        self.assertEqual(mcp["docs"], {"url": "https://d/mcp",
+                                       "headers": {"Authorization": "Bearer x"}})
+        # pi rejects SSE outright.
+        self.assertNotIn("old", mcp)
+        self.assertTrue(any("'old'" in s for s in ctx.report.skipped_unmappable))
+
+        # Back the other way, with pi-only fields and an override-only entry.
+        back = self.tmp / "back"
+        back.mkdir()
+        mcp["docs"]["exposure"] = "deferred"
+        mcp["disabled-here"] = {"enabled": False}
+        (self.dst / "mcp.json").write_text(json.dumps({"mcpServers": mcp}))
+        ctx2 = make_ctx(self.dst, back)
+        m.run_pi_to_claude(ctx2, lossy_decisions={})
+        got = json.loads((back / ".claude.json").read_text())["mcpServers"] \
+            if (back / ".claude.json").exists() else \
+            json.loads((m.claude_mcp_path(ctx2)).read_text())["mcpServers"]
+        self.assertEqual(got["fs"]["command"], "npx")
+        self.assertEqual(got["docs"], {"type": "http", "url": "https://d/mcp",
+                                       "headers": {"Authorization": "Bearer x"}})
+        self.assertNotIn("disabled-here", got)
+        notes = " ".join(ctx2.report.notes)
+        self.assertIn("exposure", notes)
+        self.assertIn("override-only", notes)
+
+    def test_pi_mcp_reaches_codex_cursor_and_opencode(self):
+        (self.src / "mcp.json").write_text(json.dumps({"mcpServers": {
+            "fs": {"command": "srv", "args": ["--x"]},
+            "docs": {"url": "https://d/mcp"}}}))
+        for runner, check in (
+            (m.run_pi_to_codex, lambda d: tomllib.loads(
+                (d / "config.toml").read_text())["mcp_servers"]),
+            (m.run_pi_to_cursor, lambda d: json.loads(
+                (d / "mcp.json").read_text())["mcpServers"]),
+            (m.run_pi_to_opencode, lambda d: json.loads(
+                (d / "opencode.json").read_text())["mcp"]),
+        ):
+            dst = self.tmp / runner.__name__
+            dst.mkdir()
+            runner(make_ctx(self.src, dst), lossy_decisions={})
+            servers = check(dst)
+            self.assertIn("fs", servers)
+            self.assertIn("docs", servers)
+
+    def test_codex_cursor_opencode_mcp_reach_pi(self):
+        (self.src / "config.toml").write_text(
+            '[mcp_servers.fs]\ncommand = "srv"\n'
+            '[mcp_servers.docs]\nurl = "https://d/mcp"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.run_codex_to_pi(ctx, lossy_decisions={})
+        mcp = json.loads((self.dst / "mcp.json").read_text())["mcpServers"]
+        self.assertEqual(mcp["fs"], {"command": "srv"})
+        self.assertEqual(mcp["docs"], {"url": "https://d/mcp"})
+
+    # ---- Cursor CLI 2026.10 hook matchers --------------------------------
+
+    def test_tool_matchers_translate_both_ways(self):
+        self.assertEqual(m._translate_tool_matcher("Bash|Edit", True), "Shell|Write")
+        self.assertEqual(m._translate_tool_matcher("Write|Edit", True), "Write")
+        self.assertEqual(m._translate_tool_matcher("mcp__gh__search", True),
+                         "MCP:search")
+        self.assertEqual(m._translate_tool_matcher("Shell", False), "Bash")
+        self.assertEqual(m._translate_tool_matcher("MCP:search", False),
+                         "mcp__.*__search")
+        # Real regexes / unknown tools can't be mapped — dropped with a note.
+        self.assertIsNone(m._translate_tool_matcher("Bash.*", True))
+        self.assertIsNone(m._translate_tool_matcher("Delete", False))
+
+    def test_cursor_matcher_and_knobs_into_claude(self):
+        (self.src / "hooks.json").write_text(json.dumps({
+            "version": 1,
+            "hooks": {
+                "preToolUse": [{"command": "./a.sh", "matcher": "Shell",
+                                "failClosed": True}],
+                "stop": [{"command": "./b.sh", "loop_limit": 2}],
+            }}))
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_cursor_hooks(ctx)
+        hooks = json.loads((self.dst / "settings.json").read_text())["hooks"]
+        self.assertEqual(hooks["PreToolUse"][0]["matcher"], "Bash")
+        self.assertNotIn("matcher", hooks["Stop"][0])
+        notes = " ".join(ctx.report.notes)
+        self.assertIn("failClosed", notes)
+        self.assertIn("loop_limit", notes)
+
+
+# ============================================================================
+# agentty support
+# ============================================================================
+
+AGENTTY_SCHEMA = """
+CREATE TABLE project (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    git_branch TEXT
+);
+CREATE TABLE setting (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE project_setting (
+    project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (project_id, name)
+);
+"""
+
+
+def make_agentty_db(root: Path, projects: dict, active: str | None = None) -> Path:
+    """Create agentty's 0.17 settings tables (the real migration DDL) with
+    `projects` = {path: {SettingName: value}} and an optional active one."""
+    db = root / "db" / "agentty.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db))
+    con.executescript(AGENTTY_SCHEMA)
+    con.execute("PRAGMA journal_mode = WAL")
+    for path, rows in projects.items():
+        pid = con.execute("INSERT INTO project (path) VALUES (?)", (path,)).lastrowid
+        for name, value in rows.items():
+            con.execute("INSERT INTO project_setting VALUES (?, ?, ?)",
+                        (pid, name, value))
+        if path == active:
+            con.execute("INSERT INTO setting VALUES ('ActiveProjectId', ?)",
+                        (str(pid),))
+    con.commit()
+    con.close()
+    return db
+
+
+def agentty_rows(root: Path, path: str) -> dict:
+    con = sqlite3.connect(str(root / "db" / "agentty.db"))
+    try:
+        return dict(con.execute(
+            "SELECT ps.name, ps.value FROM project_setting ps "
+            "JOIN project p ON p.id = ps.project_id WHERE p.path = ?", (path,)))
+    finally:
+        con.close()
+
+
+class AgenttyTests(FsTestBase):
+    """agentty keeps per-project Smart/Fast/Review model defaults in
+    SQLite; only the Smart role maps to the other tools' default model,
+    effort and fast-mode knobs."""
+
+    def test_claude_to_agentty_writes_smart_defaults_for_active_project(self):
+        make_agentty_db(self.dst, {"/work/a": {}, "/work/b": {}}, active="/work/b")
+        (self.src / "settings.json").write_text(json.dumps({
+            "model": "claude-opus-5-5", "effortLevel": "high", "fastMode": True,
+            "hooks": {"Stop": []}}))
+        (self.src / "skills" / "x").mkdir(parents=True)
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_agentty(ctx, lossy_decisions={})
+
+        self.assertEqual(agentty_rows(self.dst, "/work/b"), {
+            "DefaultSmartAgent": "claude", "DefaultSmartModel": "claude-opus-5-5",
+            "DefaultSmartReasoningLevel": "high", "DefaultSmartSpeedMode": "fast"})
+        self.assertEqual(agentty_rows(self.dst, "/work/a"), {})
+        self.assertTrue(any("/work/b" in n for n in ctx.report.notes))
+        # Skills/hooks aren't agentty settings — one note, not "lost".
+        self.assertTrue(any("skills" in n and "hooks" in n
+                            for n in ctx.report.notes))
+        self.assertFalse((self.dst / "AGENTS.md").exists())  # user scope
+
+    def test_project_scope_targets_the_project_at_cwd_and_writes_agents_md(self):
+        project = self.tmp / "proj"
+        (project / "sub").mkdir(parents=True)
+        (project / "CLAUDE.md").write_text("# Rules\n")
+        make_agentty_db(self.dst, {str(project): {}, "/elsewhere": {}},
+                        active="/elsewhere")
+        (self.src / "settings.json").write_text(json.dumps({
+            "model": "claude-opus-4-8", "effortLevel": "max"}))
+        ctx = make_ctx(self.src, self.dst, src_doc=project / "CLAUDE.md",
+                       dst_doc=project / "sub" / ".." / "AGENTS.md")
+        m.run_claude_to_agentty(ctx, lossy_decisions={})
+
+        rows = agentty_rows(self.dst, str(project))
+        self.assertEqual(rows["DefaultSmartModel"], "claude-opus-4-8")
+        # Legacy Claude `max` is an alias for xhigh, not agentty's max.
+        self.assertEqual(rows["DefaultSmartReasoningLevel"], "xhigh")
+        self.assertEqual(agentty_rows(self.dst, "/elsewhere"), {})
+        self.assertIn("# Rules", (project / "AGENTS.md").read_text())
+        # Not in the 0.17 catalog — agentty would fall back; say so.
+        self.assertTrue(any("catalog" in n for n in ctx.report.notes))
+
+    def test_codex_to_agentty_maps_ultra_and_service_tier(self):
+        make_agentty_db(self.dst, {"/p": {}}, active="/p")
+        (self.src / "config.toml").write_text(
+            'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "ultra"\n'
+            'service_tier = "fast"\n[mcp_servers.x]\ncommand = "s"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.run_codex_to_agentty(ctx, lossy_decisions={})
+        self.assertEqual(agentty_rows(self.dst, "/p"), {
+            "DefaultSmartAgent": "codex", "DefaultSmartModel": "gpt-6.1-sol",
+            "DefaultSmartReasoningLevel": "max", "DefaultSmartSpeedMode": "fast"})
+        self.assertTrue(any("ultra" in n for n in ctx.report.notes))
+        self.assertTrue(any("MCP servers" in n for n in ctx.report.notes))
+
+    def test_cursor_opencode_pi_to_agentty(self):
+        make_agentty_db(self.dst, {"/p": {}}, active="/p")
+        (self.src / "cli-config.json").write_text(json.dumps({
+            "version": 1, "selectedModel": {
+                "modelId": "gpt-6-luna",
+                "parameters": [{"id": "effort", "value": "high"}]}}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_cursor_to_agentty(ctx, lossy_decisions={})
+        rows = agentty_rows(self.dst, "/p")
+        self.assertEqual(rows["DefaultSmartAgent"], "codex")  # inferred
+        self.assertEqual(rows["DefaultSmartReasoningLevel"], "high")
+
+        (self.src / "opencode.json").write_text(json.dumps({
+            "model": "google/gemini-3.8-flash", "mcp": {"x": {"type": "remote", "url": "u"}}}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_opencode_to_agentty(ctx, lossy_decisions={})
+        rows = agentty_rows(self.dst, "/p")
+        self.assertEqual(rows["DefaultSmartAgent"], "gemini")
+        self.assertEqual(rows["DefaultSmartModel"], "gemini-3.8-flash")
+        # opencode isn't an agentty backend: its MCP servers are reported.
+        self.assertTrue(any("MCP servers" in s for s in ctx.report.skipped_unmappable))
+
+        (self.src / "settings.json").write_text(json.dumps({
+            "defaultProvider": "anthropic", "defaultModel": "claude-sonnet-5-5",
+            "defaultThinkingLevel": "off"}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_pi_to_agentty(ctx, lossy_decisions={})
+        rows = agentty_rows(self.dst, "/p")
+        self.assertEqual(rows["DefaultSmartAgent"], "claude")
+        self.assertEqual(rows["DefaultSmartReasoningLevel"], "high")  # untouched
+        self.assertTrue(any("defaultThinkingLevel" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def _seed_source(self, **extra) -> None:
+        rows = {"DefaultSmartAgent": "claude", "DefaultSmartModel": "claude-opus-5-5",
+                "DefaultSmartReasoningLevel": "max", "DefaultSmartSpeedMode": "fast",
+                "DefaultFastModel": "claude-haiku-4-5-20251001",
+                "DefaultResponseStyle": "concise"}
+        rows.update(extra)
+        make_agentty_db(self.src, {"/p": rows}, active="/p")
+
+    def test_agentty_to_claude_collapses_max_and_sets_fast_mode(self):
+        self._seed_source()
+        ctx = make_ctx(self.src, self.dst)
+        m.run_agentty_to_claude(ctx, lossy_decisions={})
+        settings = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(settings["model"], "claude-opus-5-5")
+        self.assertEqual(settings["effortLevel"], "xhigh")
+        self.assertTrue(settings["fastMode"])
+        skipped = " ".join(ctx.report.skipped_unmappable)
+        self.assertIn("DefaultFastModel", skipped)
+        self.assertIn("DefaultResponseStyle", skipped)
+        self.assertTrue(any("'max'" in n for n in ctx.report.notes))
+
+    def test_agentty_to_codex_is_one_to_one_for_codex_models(self):
+        self._seed_source(DefaultSmartAgent="codex", DefaultSmartModel="gpt-6-astra")
+        ctx = make_ctx(self.src, self.dst)
+        m.run_agentty_to_codex(ctx, lossy_decisions={})
+        cfg = tomllib.loads((self.dst / "config.toml").read_text())
+        self.assertEqual(cfg["model"], "gpt-6-astra")
+        self.assertEqual(cfg["model_reasoning_effort"], "max")
+        self.assertEqual(cfg["service_tier"], "fast")
+        self.assertTrue(cfg["features"]["fast_mode"])
+
+    def test_agentty_fast_speed_of_other_backend_is_not_applied(self):
+        self._seed_source()  # claude backend, fast
+        ctx = make_ctx(self.src, self.dst)
+        m.run_agentty_to_codex(ctx, lossy_decisions={})
+        cfg = tomllib.loads((self.dst / "config.toml").read_text())
+        self.assertNotIn("service_tier", cfg)
+        self.assertTrue(any("non-Codex" in n for n in ctx.report.notes))
+
+    def test_agentty_to_cursor_opencode_pi(self):
+        self._seed_source()
+        for runner in (m.run_agentty_to_cursor, m.run_agentty_to_opencode,
+                       m.run_agentty_to_pi):
+            dst = self.tmp / runner.__name__
+            dst.mkdir()
+            ctx = make_ctx(self.src, dst)
+            runner(ctx, lossy_decisions={})
+            if runner is m.run_agentty_to_cursor:
+                cfg = json.loads((dst / "cli-config.json").read_text())
+                self.assertEqual(cfg["selectedModel"]["modelId"], "claude-opus-5-5")
+                self.assertEqual(cfg["selectedModel"]["parameters"],
+                                 [{"id": "effort", "value": "high"}])  # max → high
+            elif runner is m.run_agentty_to_opencode:
+                cfg = json.loads((dst / "opencode.json").read_text())
+                self.assertEqual(cfg["model"], "anthropic/claude-opus-5-5")
+            else:
+                cfg = json.loads((dst / "settings.json").read_text())
+                self.assertEqual(cfg["defaultProvider"], "anthropic")
+                self.assertEqual(cfg["defaultThinkingLevel"], "max")
+            # None of them has a fast-mode setting.
+            self.assertTrue(any("fast" in s for s in ctx.report.skipped_unmappable))
+
+    def test_missing_db_and_unregistered_project_are_reported_not_written(self):
+        (self.src / "settings.json").write_text(json.dumps({"model": "claude-opus-5-5"}))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_agentty(ctx, lossy_decisions={})
+        self.assertFalse((self.dst / "db" / "agentty.db").exists())
+        self.assertTrue(any("start agentty once" in s
+                            for s in ctx.report.skipped_unmappable))
+        self.assertEqual(ctx.report.migrated_clean, [])
+
+        make_agentty_db(self.dst, {"/p": {}})  # registered, but none active
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_agentty(ctx, lossy_decisions={})
+        self.assertEqual(agentty_rows(self.dst, "/p"), {})
+        self.assertTrue(any("no registered project" in s
+                            for s in ctx.report.skipped_unmappable))
+
+    def test_plan_mode_records_db_and_backup_restores_old_rows(self):
+        db = make_agentty_db(self.dst, {"/p": {"DefaultSmartModel": "gpt-6-luna",
+                                               "DefaultSmartAgent": "codex"}},
+                             active="/p")
+        (self.src / "settings.json").write_text(json.dumps({"model": "claude-opus-5-5"}))
+
+        ctx = make_ctx(self.src, self.dst)
+        ctx.plan_mode = True
+        m.run_claude_to_agentty(ctx, lossy_decisions={})
+        self.assertIn(db, ctx.planned_writes)
+        self.assertEqual(agentty_rows(self.dst, "/p")["DefaultSmartModel"], "gpt-6-luna")
+        backup_root = m.perform_backup(ctx)
+
+        ctx.plan_mode = False
+        m.run_claude_to_agentty(ctx, lossy_decisions={})
+        self.assertEqual(agentty_rows(self.dst, "/p"), {
+            "DefaultSmartAgent": "claude", "DefaultSmartModel": "claude-opus-5-5"})
+
+        rc = m.restore_from_backup(backup_root, interactive=False, dry_run=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(agentty_rows(self.dst, "/p"), {
+            "DefaultSmartAgent": "codex", "DefaultSmartModel": "gpt-6-luna"})
+
+    def test_dry_run_never_touches_the_db(self):
+        make_agentty_db(self.dst, {"/p": {}}, active="/p")
+        (self.src / "settings.json").write_text(json.dumps({"model": "claude-opus-5-5"}))
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            ctx = make_ctx(self.src, self.dst, dry_run=True)
+            m.run_claude_to_agentty(ctx, lossy_decisions={})
+        self.assertEqual(agentty_rows(self.dst, "/p"), {})
+        self.assertIn(self.dst / "db" / "agentty.db", ctx.planned_writes)
+
+    def test_running_agentty_blocks_the_write(self):
+        try:
+            import fcntl
+        except ImportError:
+            self.skipTest("flock probe is POSIX-only")
+        make_agentty_db(self.dst, {"/p": {}}, active="/p")
+        lock = self.dst / "db" / "agentty.lock"
+        lock.touch()
+        (self.src / "settings.json").write_text(json.dumps({"model": "claude-opus-5-5"}))
+        with open(lock, "r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            ctx = make_ctx(self.src, self.dst)
+            m.run_claude_to_agentty(ctx, lossy_decisions={})
+        self.assertEqual(agentty_rows(self.dst, "/p"), {})
+        self.assertTrue(any("agentty is running" in s
+                            for s in ctx.report.skipped_unmappable))
+        # Released lock → the write goes through.
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_agentty(ctx, lossy_decisions={})
+        self.assertEqual(agentty_rows(self.dst, "/p")["DefaultSmartModel"],
+                         "claude-opus-5-5")
+
+    def test_tool_paths_keep_the_db_root_at_project_scope(self):
+        project = self.tmp / "proj"
+        project.mkdir()
+        with mock.patch.dict(os.environ, {"AGENTTY_ROOT": str(self.tmp / "root")}), \
+                mock.patch.object(m.Path, "cwd", return_value=project):
+            user = m._tool_paths("agentty", "user", None)
+            proj = m._tool_paths("agentty", "project", None)
+        self.assertEqual(user["root"], self.tmp / "root")
+        self.assertIsNone(user["doc"])
+        self.assertEqual(proj["root"], self.tmp / "root")
+        self.assertEqual(proj["doc"], project / "AGENTS.md")
+        self.assertIn(("agentty", "claude"), m.RUNNERS)
+        self.assertIn(("claude", "agentty"), m.RUNNERS)
 
 
 if __name__ == "__main__":

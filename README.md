@@ -4,22 +4,24 @@ A single-file Python script that migrates settings and custom configuration
 between [Claude Code](https://claude.com/claude-code) (`~/.claude`),
 [Codex CLI](https://github.com/openai/codex) (`~/.codex`),
 [Cursor](https://cursor.com) (`~/.cursor`),
-[opencode](https://opencode.ai) (`~/.config/opencode`), and
-[pi](https://pi.dev) (`~/.pi/agent`), in any pairwise direction — with an
-upfront backup of every file it will touch and a `--restore` command to
-undo a run.
+[opencode](https://opencode.ai) (`~/.config/opencode`),
+[pi](https://pi.dev) (`~/.pi/agent`), and
+[agentty](https://agentty.xyz) (`~/.agentty`), in any pairwise direction —
+with an upfront backup of every file it will touch and a `--restore`
+command to undo a run.
 
 Requires Python 3.9+. No third-party dependencies. On 3.11+ it uses the
 stdlib `tomllib`; on 3.9/3.10 it falls back to a small bundled TOML reader
 covering the subset Codex's `config.toml` uses.
 
-**Tested against:** Claude Code `2.1.271`, Codex CLI `0.137.0` (schemas
-cross-checked with the 0.154 docs and source), Cursor CLI `2026.09.10`
-(docs plus the shipped config schema), opencode 1.18.31 docs, and pi
-0.85.1 docs, all as of 2026-09-14. The script reads documented config schemas, so minor version bumps
-should keep working; if a future release renames or removes a key, the
-migrator will flag it as "not translated" in the report rather than corrupt
-your config.
+**Tested against:** Claude Code `2.1.296`, Codex CLI `0.137.0` (schemas
+cross-checked with the 0.162.1 source and docs), Cursor CLI `2026.10.01`
+(docs plus the shipped config schema), opencode 1.18.35 docs, pi 1.1.0
+docs, and agentty 0.17.0 source, all as of 2026-10-10. The script reads
+documented config schemas, so minor version bumps should keep working; any
+key the migrator doesn't consume — including one a future release adds —
+is listed as "not translated" in the report rather than dropped or
+corrupted.
 
 > Codex CLI ships its own interactive `/import` command (0.145 imports
 > from both Claude Code and Cursor). This migrator remains useful for the
@@ -29,13 +31,15 @@ your config.
 ## Usage
 
 ```bash
-# Any pairwise direction between {claude, codex, cursor, opencode, pi}.
+# Any pairwise direction between {claude, codex, cursor, opencode, pi, agentty}.
 python3 migrate.py --from claude --to codex
 python3 migrate.py --from cursor --to claude
 python3 migrate.py --from codex  --to cursor
 python3 migrate.py --from claude --to opencode
 python3 migrate.py --from opencode --to codex
 python3 migrate.py --from pi --to claude
+python3 migrate.py --from claude --to agentty   # model/effort/fast-mode → agentty's project defaults
+python3 migrate.py --from agentty --to codex
 
 # Project-level instead of user-level (also accepts --scope both)
 python3 migrate.py --from claude --to cursor --scope project
@@ -56,10 +60,10 @@ python3 migrate.py --restore /path/to/backups/pre-migrate-YYYYMMDD-HHMMSS
 
 | Flag | Meaning |
 |---|---|
-| `--from {claude,codex,cursor,opencode,pi}` / `--to {claude,codex,cursor,opencode,pi}` | Source and destination tools. Required unless `--restore` is given. |
+| `--from {claude,codex,cursor,opencode,pi,agentty}` / `--to {claude,codex,cursor,opencode,pi,agentty}` | Source and destination tools. Required unless `--restore` is given. |
 | `--restore [BACKUP_DIR]` | Reverse a previous migration. Omit to use the latest backup found under any tool's backups dir. |
 | `--scope {user,project,both}` | Which config scope(s) to migrate (default: `user`). |
-| `--claude-dir PATH` / `--codex-dir PATH` / `--cursor-dir PATH` / `--opencode-dir PATH` / `--pi-dir PATH` | Explicit config dirs; overrides `--scope`. |
+| `--claude-dir PATH` / `--codex-dir PATH` / `--cursor-dir PATH` / `--opencode-dir PATH` / `--pi-dir PATH` / `--agentty-dir PATH` | Explicit config dirs; overrides `--scope`. For agentty this is its data root (default `$AGENTTY_ROOT` or `~/.agentty`). |
 | `--dry-run` | Print the plan and report, write nothing. |
 | `--merge` / `--overwrite` | Merge into existing destination files where sensible (default), or replace outright. Backups happen either way. |
 | `--no-backup` | Skip the upfront backup (and disable `--restore` for this run). Not recommended. |
@@ -76,7 +80,8 @@ confirmed), skipped by user choice, and not translated (no equivalent).
 
 **Skills (every direction)**
 
-All supported tools speak the same open [Agent Skills](https://agentskills.io)
+Every tool except agentty (which has no skills of its own — see below)
+speaks the same open [Agent Skills](https://agentskills.io)
 format, so `skills/<name>/` directories copy verbatim — SKILL.md,
 frontmatter, and bundled assets included. Codex's tool-managed
 `skills/.system/` is excluded, opencode's legacy singular `skill/` dir is
@@ -100,8 +105,9 @@ destination would have found the source dir anyway.
 | `.mcp.json` / `~/.claude.json`: `mcpServers` (stdio + HTTP) | `config.toml:[mcp_servers.*]` |
 | `settings.json:env`                    | `config.toml:[shell_environment_policy] set` |
 | `settings.json:effortLevel`            | `config.toml:model_reasoning_effort`       |
+| `settings.json:fastMode`               | `config.toml:service_tier = "fast"` + `[features] fast_mode` |
 | `outputStyle` file contents *(c→x only)*  | fenced block inside `AGENTS.md`         |
-| `CLAUDE.md` imports `AGENTS.md` *(project x→c)* | `AGENTS.md`                    |
+| `AGENTS.md` read natively, or imported by an existing `CLAUDE.md` *(project x→c)* | `AGENTS.md` |
 | fenced block inside `CLAUDE.md` *(x→c only)* | `config.toml:developer_instructions` (legacy `instructions` too) |
 | `agents/*.md` *(x→c: from `.codex/agents/*.toml`)* | `agents/*.toml`               |
 
@@ -150,18 +156,66 @@ read; plural canonical dirs are written.
 |----------------------------------------|---------|
 | `AGENTS.md` (or `AGENTS.override.md`)  | `CLAUDE.md` / `AGENTS.md` / cursor rules. pi reads AGENTS.md *and* CLAUDE.md natively, so same-file project cases become a report note. pi 0.84+ loads `AGENTS.override.md` *instead of* AGENTS.md when both sit in one directory, so the override is what leaves pi, and an override at the destination is flagged as shadowing what was written. |
 | `prompts/*.md` (`description`, `argument-hint`) | Claude `commands/`, Codex `prompts/` (verbatim — the formats are identical), Cursor slash-invocable skills, opencode `commands/`. |
+| `mcp.json:mcpServers` (user `~/.pi/agent`, project `.pi/`) | `mcpServers` / `[mcp_servers.*]` / Cursor `mcp.json` / opencode `mcp` — stdio and streamable HTTP, both ways (pi 0.99+). |
 | `settings.json:defaultProvider` + `defaultModel` | `settings.json:model` / `config.toml:model` / `cli-config.json:model` / opencode's `provider/model` — the provider field makes this the cleanest model mapping of any pair; cross-provider moves get a review note. |
 | `settings.json:defaultThinkingLevel` (+ `modelThinkingLevels` for the startup model) | `effortLevel` / `model_reasoning_effort` / Cursor `effort` parameter. pi ↔ Codex is 1:1 (`off`↔`none`, `minimal`…`xhigh`, `max`↔`max`); toward Claude, `max` maps down to `xhigh` with a note and `off` is reported. A `modelThinkingLevels` entry for the startup model wins over `defaultThinkingLevel` (as in pi); entries for other models are reported. Templates using pi's `${1:-default}` shell substitutions are flagged on the way out. |
 
-pi deliberately has **no MCP, no subagents, and no hooks** (extensions are
-TypeScript code). Migrating *to* pi reports those source features as not
-translated — MCP servers are suggested as CLI-tool skills, subagents point
-at the `pi-subagents` community package — instead of silently dropping
-them. That also means every pi pair is Tier A only: there are no pi Tier B
-options to confirm.
+pi gained MCP in 0.99 (`mcpServers` in the Claude shape: stdio
+`command`/`args`/`env` or streamable-HTTP `url`/`headers`), so servers
+transfer in both directions. pi rejects SSE, and its own `exposure`,
+`toolExposure`, `description`, `oauth` and `auth` fields are dropped with
+a note on the way out — as are project entries that only override a
+user-level server's enabled state. pi still deliberately has **no
+subagents and no hooks** (extensions are TypeScript code). Migrating *to*
+pi reports those source features as not translated — subagents point at
+the `pi-subagents` community package — instead of silently dropping them.
+Every pi pair is Tier A only: there are no pi Tier B options to confirm.
+
+**agentty ↔ everything**
+
+[agentty](https://agentty.xyz) is an orchestrator rather than an agent:
+it runs Codex, Claude Code, Gemini CLI and Antigravity CLI as *backends*
+inside per-session git worktrees, and every backend reads its own config
+(`~/.codex`, `~/.claude`, `AGENTS.md`/`CLAUDE.md`/`GEMINI.md`). The only
+configuration agentty owns is the per-project model defaults it keeps in
+SQLite (`~/.agentty/db/agentty.db`, or under `$AGENTTY_ROOT`): for each of
+its Smart/Fast/Review roles a backend ("agent"), a model id, a reasoning
+level (`low`…`max`) and a speed (`normal`/`fast`).
+
+| agentty (`project_setting` rows)       | Maps to |
+|----------------------------------------|---------|
+| `DefaultSmartAgent` + `DefaultSmartModel` | `settings.json:model` / `config.toml:model` / `cli-config.json:model` / opencode's `provider/model` / pi's `defaultProvider` + `defaultModel`. The backend names the provider (`claude`→`anthropic`, `codex`→`openai`, `gemini`/`antigravity`→`google`); into agentty the backend comes from the source tool, the opencode/pi provider, or the model-id prefix for Cursor. A model outside agentty 0.17's catalog is written but flagged (agentty falls back to its default). |
+| `DefaultSmartReasoningLevel`           | `effortLevel` (`max` collapses to `xhigh`) / `model_reasoning_effort` and pi's thinking level (1:1 — all five tiers exist; Codex `ultra` comes in as `max`, `minimal` as `low`, and `none`/`off` are reported) / Cursor's `effort` parameter (`xhigh`/`max` → `high`). opencode has no knob. |
+| `DefaultSmartSpeedMode`                | `fastMode: true` / `service_tier = "fast"` + `[features] fast_mode` — only when the backend matches the destination. Cursor, opencode and pi have no fast-mode setting. |
+| `<project>/AGENTS.md`                  | Read by the Codex and Antigravity backends; the Claude backend reads `CLAUDE.md`. At project scope `claude → agentty` writes `AGENTS.md` from `CLAUDE.md` (+ rules/outputStyle, like `claude → codex`), `agentty → claude` leaves `AGENTS.md` for Claude Code to read natively, and every other pair is a same-file note. |
+
+Rows are keyed by registered project, so `--scope project` targets the
+project containing the current directory and `--scope user` targets
+agentty's active project (the report names it); a project agentty hasn't
+opened yet is reported, not created. The Fast and Review roles,
+`DefaultResponseStyle`, launch configurations, theme and orchestration
+settings have no counterpart and are listed as not translated. Skills,
+slash commands, MCP servers, hooks, subagents and permissions are never
+agentty settings: coming from Claude Code or Codex they already apply
+(agentty launches that CLI with its own config) and the report says so in
+one note; coming from Cursor, opencode or pi they are reported with a
+pointer to migrate `--to claude`/`--to codex` instead. The migrator
+refuses to write while agentty is running (it probes agentty's instance
+lock), backs up `agentty.db` and its WAL like any other file, and
+checkpoints the database after writing so `--restore` can copy it back
+byte-for-byte. Every agentty pair is Tier A only.
 
 Notes:
 
+- At project scope, Claude Code 2.1.277+ reads `AGENTS.md` itself when no
+  `CLAUDE.md` exists, so codex/opencode/pi/agentty→claude leave the file
+  alone and note it. When a `CLAUDE.md` already exists (or fenced
+  `developer_instructions` have to land in one) it gets a single
+  `@AGENTS.md` import instead, since a present `CLAUDE.md` shadows
+  `AGENTS.md`.
+- Fast mode is one knob on both sides: Claude Code's `fastMode: true`
+  (`/fast`) and Codex's `service_tier = "fast"` + `[features] fast_mode`
+  (`/fast`) map to each other; other Codex service tiers are reported.
 - Cursor deprecated `.cursor/commands/` in favor of skills, so Claude
   slash commands and Codex prompts land in Cursor as skills with
   `disable-model-invocation: true` — still invocable from the `/` menu.
@@ -194,7 +248,9 @@ Notes:
   model in both directions, higher tiers collapse to `high` with a note,
   and `none`/`minimal`/`off` are reported. Cursor agent files use the
   `model[effort=…]` bracket syntax, which also maps — other bracket
-  params like `context=`/`fast=` are flagged as dropped.
+  params like `context=`/`fast=` are flagged as dropped. agentty's
+  `low`…`max` levels map like pi's: 1:1 with Codex and pi, `max`
+  collapsing to Claude `xhigh` and Cursor `high`.
 - At project scope, Cursor reads `AGENTS.md` natively, so codex→cursor
   leaves it in place and notes that instead of splitting it into rules.
 
@@ -213,7 +269,7 @@ lets you accept or skip per-item (interactively, or via
 | Codex  | `hooks`           | `hooks` → `.codex/hooks.json` + `Notification` → `notify` | Codex hooks share Claude's event names/shape, so command hooks on shared events (PreToolUse, PostToolUse, Stop, SessionEnd, …) translate near-verbatim, and `mcp_tool` hooks (Codex 0.15x, same `server`/`tool`/`input` shape) carry with a note to re-check `${…}` input templates. Other hook types (http, prompt, agent) and Claude-only events (FileChanged, …) are dropped. |
 | Codex  | `agents`          | `agents/*.md` → `.codex/agents/*.toml` | Claude subagents become Codex custom agents. `name`, `description`, `model`, `effort`, and `permissionMode` (`plan` → `read-only`, `acceptEdits` → `workspace-write`) map to TOML; skills/tool lists become prompt guidance, and other Claude-only fields (`omitClaudeMd`, `memory`, `hooks`, …) are listed for manual review. |
 | Cursor | `agents_cursor`   | `agents/*.md` → `.cursor/agents/*.md` | Cursor runs subagents natively (and reads `.claude/agents/` in place — this copy makes `.cursor/agents` canonical). `name`/`description`/`model` map; `effort` folds into Cursor's `model[effort=…]`; `background` → `is_background`; `permissionMode: readOnly/plan` → `readonly`. Claude-only fields (`tools`, `hooks`, `memory`, `skills`, …) are dropped with in-file notes. |
-| Cursor | `hooks_cursor`    | `hooks` → `.cursor/hooks.json` | Cursor hooks use camelCase events and a flat shape. Command hooks on shared events (PostToolUseFailure included) translate; matchers, non-command hook types, and Claude-only events are dropped. |
+| Cursor | `hooks_cursor`    | `hooks` → `.cursor/hooks.json` | Cursor hooks use camelCase events and a flat shape. Command hooks on shared events (PostToolUseFailure included) translate, and plain tool-name matchers on the tool events carry into Cursor CLI 2026.10's `matcher` field (`Bash`→`Shell`, `Edit`→`Write`, `mcp__srv__tool`→`MCP:tool`); regex matchers, non-command hook types, and Claude-only events are dropped. |
 | opencode | `permissions_opencode` | `permissions` → `opencode.json:permission` | Claude `Bash(cmd:*)` prefix rules become opencode glob patterns (`"cmd*"`); `Write`/`Read`/`WebFetch` wildcards become tool-level actions. The intent carries, but opencode is last-match-wins where Claude is most-specific-wins. |
 | opencode | `agents_opencode` | `agents/*.md` → opencode `agents/*.md` | opencode runs subagents natively (`mode: subagent`). `name`/`description`/`model` map (provider-qualified); `readOnly`/`plan` permission modes become `permission: edit/bash deny`; Claude-only fields are dropped with in-file notes. |
 
@@ -232,7 +288,7 @@ lets you accept or skip per-item (interactively, or via
 
 | Target | ID | Translation | Why lossy |
 |---|---|---|---|
-| Claude | `cursor_hooks`    | `hooks.json` → `settings.json:hooks` | Command hooks on shared events translate; Cursor prompt-type hooks and Cursor-only events (`beforeShellExecution`, MCP interception, tab hooks, …) are dropped. |
+| Claude | `cursor_hooks`    | `hooks.json` → `settings.json:hooks` | Command hooks on shared events translate (tool-type matchers become Claude tool-name matchers); Cursor prompt-type hooks, `failClosed`/`loop_limit`, and Cursor-only events (`beforeShellExecution`, MCP interception, tab hooks, `workspaceOpen`, …) are dropped. |
 
 #### From opencode (`--from opencode`)
 
@@ -249,29 +305,32 @@ or through fenced metadata in `AGENTS.md` for Codex.
 
 ### Tier C — not translated
 
-Listed in `MIGRATION_REPORT.md` so you know to recreate them by hand:
+Every top-level settings key a direction doesn't consume is listed in
+`MIGRATION_REPORT.md` — there is no hand-maintained allowlist to fall
+behind a release — so you know what to recreate by hand. The notable ones:
 
 - **Claude-only:** `statusLine`, `plugins/`, theme, `fallbackModel`,
-  `availableModels`, `autoMode`, `maxEffortLevel`/`modelSettings`,
-  `timeFormat`/`timeZone`, `bashOutputMaxChars`/`taskOutputMaxChars`,
-  auto-memory settings, sandbox settings, slash-command
-  `model`/`allowed-tools` frontmatter, the `omitClaudeMd` agent field, and
-  hook events with no counterpart on the destination. When migrating to
-  Cursor, also: `permissions` (Cursor's CLI has its own allow/deny rule
-  files — `~/.cursor/cli-config.json` / `.cursor/cli.json` — rebuild by
-  hand), `env`, `outputStyle`.
+  `availableModels`/`deniedModels`, `autoMode`, `maxEffortLevel`/`modelSettings`,
+  `autoCompactWindow`, `timeFormat`/`timeZone`, `bashOutputMaxChars`,
+  auto-memory settings, sandbox settings, the long tail of managed and
+  TUI keys, slash-command `model`/`allowed-tools` frontmatter, subagent
+  fields without a counterpart (`omitClaudeMd`, `autoCompactWindow`,
+  `mcpServers`, `isolation`, …), and hook events with no counterpart on
+  the destination. When migrating to Cursor, also: `permissions` (Cursor's
+  CLI has its own allow/deny rule files — `~/.cursor/cli-config.json` /
+  `.cursor/cli.json` — rebuild by hand), `env`, `outputStyle`.
 - **Codex-only:** `model_provider(s)`, `shell_environment_policy`
-  filters/include_only/exclude (only `set` maps), `web_search`, `features`,
-  `default_permissions` / named `[permissions.*]` profiles,
-  `disable_response_storage` / history persistence, `tui` settings,
-  `hide_agent_reasoning`, `model_instructions_file`,
-  `plan_mode_reasoning_effort`, `personality`, `project_doc_max_bytes`,
-  `project_doc_fallback_filenames`, `project_root_markers`,
+  filters/include_only/exclude (only `set` maps), `web_search`, `features`
+  other than `fast_mode`, `default_permissions` / named `[permissions.*]`
+  profiles, `history`, `tui` settings, `hide_agent_reasoning`,
+  `model_instructions_file`, `plan_mode_reasoning_effort`, `personality`
+  (deprecated in 0.162 — `friendly`/`pragmatic` no longer select a style),
+  `project_doc_*`, `project_root_markers`, `daybreak`, the
   `[agents]`/`[memories]`/`[apps]`/`[plugins]`/`[marketplaces]`/
-  `[skills]`/`[otel]`/`[computer_use]`/`[browser_use]` tables, and the
-  `Interrupt` hook event. When migrating to Cursor, also: `approval_policy`,
-  `sandbox_mode`, `sandbox_workspace_write`, `shell_environment_policy`,
-  `profiles`, `notify`.
+  `[skills]`/`[otel]`/`[cloud]`/`[computer_use]`/`[browser_use]` tables,
+  and the `Interrupt` hook event. When migrating to Cursor, also:
+  `approval_policy`, `sandbox_mode`, `sandbox_workspace_write`,
+  `shell_environment_policy`, `profiles`, `notify`.
 - **Cursor-only:** Cursor IDE settings (`User/settings.json`),
   keybindings, extensions list, in-app global rules, plugins
   (`.cursor-plugin/` manifests differ from Claude plugins — reinstall from
@@ -280,16 +339,24 @@ Listed in `MIGRATION_REPORT.md` so you know to recreate them by hand:
   not agent config).
 - **opencode-only:** `provider` blocks, `small_model`, `plugin` (plugins
   are TypeScript code, not translatable config — the reason Claude hooks
-  also can't land in opencode), `formatter`, `lsp`, `default_agent`,
-  `shell`, `theme`/`keybinds`/`tui` (tui.json), `share`, `autoupdate`,
-  `snapshot`, `compaction`, `instructions` file references (noted so you
-  can copy the files).
+  also can't land in opencode), inline `agent`/`command` tables (the
+  file-based agents and commands do migrate), `formatter`, `lsp`,
+  `default_agent`, `shell`, `theme`/`keybinds`/`tui` (tui.json), `share`,
+  `autoupdate`, `snapshot`, `compaction`, `instructions` file references
+  (noted so you can copy the files).
 - **pi-only:** `SYSTEM.md`/`APPEND_SYSTEM.md` (system-prompt replacement),
   `keybindings.json`, `models.json` (custom providers — may embed
-  secrets), themes, `extensions/` (TypeScript code), and settings keys
-  like `steeringMode`, `compaction`, `thinkingBudgets`, `packages`,
-  `defaultTools`, `tuiMode`, and `modelThinkingLevels` entries for models
-  other than the startup one.
+  secrets), themes, `extensions/` (TypeScript code), the resource arrays
+  (`skills`, `prompts`, `extensions`, `packages`, `themes` — copy those
+  dirs by hand), MCP `exposure`/`toolExposure`/`oauth`/`auth`, and
+  settings such as `steeringMode`, `compaction`, `codemode`,
+  `thinkingBudgets`, `defaultTools`, `tuiMode`, and `modelThinkingLevels`
+  entries for models other than the startup one.
+- **agentty-only:** the Fast and Review role defaults,
+  `DefaultResponseStyle`, `LaunchConfiguration`,
+  `IncludeCoauthoredByAgentty`, theme, orchestration parallelism and
+  auto-approve, and `.agentty/review-rules.json` (per-path review
+  criteria — no other tool has them).
 
 ## What is never touched
 
@@ -308,8 +375,12 @@ The script ignores state, secrets, and caches on the source side, including:
 - **opencode:** `~/.local/share/opencode/` (auth.json, mcp-auth.json,
   session storage, logs) and `~/.cache/opencode/` — everything outside
   `opencode.json[c]`, `AGENTS.md`, and the agents/commands/skills dirs
-- **pi:** `~/.pi/agent/auth.json`, `sessions/`, `trust.json`, and the
-  `npm/`/`git/` package caches
+- **pi:** `~/.pi/agent/auth.json`, `mcp-auth.json`, `sessions/`,
+  `trust.json`, and the `npm/`/`git/` package caches
+- **agentty:** everything in `agentty.db` other than the targeted
+  project's Smart-role `project_setting` rows (sessions, messages, usage,
+  other projects), the `wt/` worktrees, `db/agentty.lock`, and the
+  telemetry installation id
 
 ## How a migration runs
 
@@ -318,7 +389,8 @@ The script ignores state, secrets, and caches on the source side, including:
 2. **Plan pass** — walk the migration once without writing anything,
    collecting the complete list of destination files that will be touched.
 3. **Backup** — copy every planned destination that already exists into
-   `<dst>/backups/pre-migrate-<timestamp>/`, preserving relative layout,
+   `<dst>/backups/pre-migrate-<timestamp>/` (agentty's SQLite database
+   and its WAL file included), preserving relative layout,
    and write a `manifest.json` that `--restore` later reads. Files the
    migration will *create* (vs. modify) are recorded as
    `existed_before: false` so restore can delete them on revert.
@@ -345,10 +417,10 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-149 tests, stdlib-only. They cover the TOML writer, JSONC stripping,
+174 tests, stdlib-only. They cover the TOML writer, JSONC stripping,
 frontmatter and fenced-block round-trips, MCP normalization (stdio +
-streamable HTTP + opencode local/remote), every Tier A direction across
-all 20 tool pairs, skills tree copies (byte-identical round-trip, the
+streamable HTTP + opencode local/remote + pi `mcp.json`), every Tier A
+direction across all 30 tool pairs, skills tree copies (byte-identical round-trip, the
 Codex system-skills exclusion, pi bare-file conversion), the slash-command
 `description`/`argument-hint` round-trips (including through opencode and
 pi), prefix-rule emission/parsing and its round-trips (Claude and
@@ -359,10 +431,16 @@ effort parameter, pi thinking-level mapping (per-model overrides included),
 `AGENTS.override.md` handling, bare-skill discovery rules and feature-gap
 reporting, MDC frontmatter + legacy `.cursorrules`
 parsing, every Tier B heuristic, the plan-mode contract, the
-backup-then-restore round-trip, and a full cursor→claude→cursor metadata
-round-trip. Verified on Python 3.9 and 3.13. The generated Codex prefix
-rules were additionally validated against the real `codex execpolicy
-check` tool.
+backup-then-restore round-trip, a full cursor→claude→cursor metadata
+round-trip, Claude↔Codex fast mode, Cursor hook matchers both ways, the
+catch-all key reporting, Claude Code's native `AGENTS.md` read, and
+agentty: Smart-role writes into a real-schema SQLite fixture (active
+project at user scope, cwd project at project scope), reads into all five
+other tools, the unknown-model and unregistered-project cases, dry-run
+and plan mode never touching the database, backup → write → restore on
+the database, and the running-instance lock probe. Verified on Python 3.9
+and 3.13. The generated Codex prefix rules were additionally validated
+against the real `codex execpolicy check` tool.
 
 ## License
 
